@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -6,14 +7,17 @@ from brakesmith.core import (
     BrakeSmithError,
     MediaFile,
     Track,
+    atomic_write_json,
     discover,
     ensure_source_unchanged,
     handbrake_command,
     normalize_languages,
     output_path,
+    quarantine_file,
     select_tracks,
     snapshot_source,
     validate_destinations,
+    validate_output,
 )
 
 
@@ -117,3 +121,32 @@ def test_destination_collision_is_rejected(tmp_path: Path):
         validate_destinations(
             [(tmp_path / "movie.mp4", destination), (tmp_path / "movie.avi", destination)]
         )
+
+
+def test_validate_output_checks_tracks(tmp_path: Path, monkeypatch):
+    output = tmp_path / "movie.part"
+    output.write_bytes(b"x" * 2048)
+    monkeypatch.setattr(
+        "brakesmith.core.probe",
+        lambda *args: MediaFile(output, "hevc", 100, 2048, [Track(1, 1, "audio", "eng")]),
+    )
+    assert validate_output(output, "ffprobe", 100, 1, 0).codec == "hevc"
+    with pytest.raises(BrakeSmithError, match="audio tracks"):
+        validate_output(output, "ffprobe", 100, 2, 0)
+
+
+def test_quarantine_never_overwrites(tmp_path: Path):
+    partial = tmp_path / "movie.part"
+    partial.write_text("first")
+    (tmp_path / "movie.part.invalid").write_text("existing")
+    quarantined = quarantine_file(partial)
+    assert quarantined.name == "movie.part.invalid.1"
+    assert quarantined.read_text() == "first"
+
+
+def test_atomic_json_refuses_existing_report(tmp_path: Path):
+    report = tmp_path / "summary.json"
+    atomic_write_json(report, {"status": "ok"})
+    assert json.loads(report.read_text()) == {"status": "ok"}
+    with pytest.raises(BrakeSmithError, match="Report exists"):
+        atomic_write_json(report, {"status": "changed"})

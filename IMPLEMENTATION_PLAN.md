@@ -22,13 +22,13 @@ Checked items are implemented, reviewed, and committed. Each stage receives a pa
 
 ## v0.3.2 — Output integrity
 
-- [ ] Validate output readability, HEVC codec, duration, selected tracks, and nonzero size
-- [ ] Quarantine invalid completed output instead of publishing it
-- [ ] Validate existing outputs before skipping
-- [ ] Distinguish valid output, invalid output, and stale partial output
-- [ ] Preserve failed HandBrake diagnostics in a per-file log
-- [ ] Write final JSON batch summary atomically
-- [ ] Refuse suspicious duration differences by default
+- [x] Validate output readability, HEVC codec, duration, selected tracks, and nonzero size
+- [x] Quarantine invalid completed output instead of publishing it
+- [x] Validate existing outputs before skipping
+- [x] Distinguish valid output, invalid output, and stale partial output
+- [x] Preserve failed HandBrake diagnostics in a per-file log
+- [x] Write final JSON batch summary atomically
+- [x] Refuse suspicious duration differences by default
 
 ## v0.3.3 — Scalable inventory
 

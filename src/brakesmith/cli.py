@@ -19,6 +19,7 @@ from . import __version__
 from .core import (
     BrakeSmithError,
     MediaFile,
+    atomic_write_json,
     discover,
     ensure_source_unchanged,
     find_executable,
@@ -27,9 +28,11 @@ from .core import (
     output_path,
     preflight_destination,
     probe,
+    quarantine_file,
     select_tracks,
     snapshot_source,
     validate_destinations,
+    validate_output,
 )
 
 app = typer.Typer(
@@ -276,6 +279,16 @@ def cleanup_partial(path: Path) -> Optional[str]:
     return None
 
 
+def write_failure_log(destination: Path, lines: list[str]) -> Path:
+    candidate = destination.with_name(f"{destination.name}.handbrake.log")
+    counter = 1
+    while candidate.exists():
+        candidate = destination.with_name(f"{destination.name}.handbrake.{counter}.log")
+        counter += 1
+    candidate.write_text("".join(lines), encoding="utf-8")
+    return candidate
+
+
 @app.command(name="run")
 def run_batch(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
@@ -305,6 +318,14 @@ def run_batch(
     allow_no_audio: bool = typer.Option(
         False, help="Allow output without audio even when source has audio."
     ),
+    invalid_existing: str = typer.Option(
+        "fail", help="Invalid existing output: fail or quarantine."
+    ),
+    stale_partial: str = typer.Option(
+        "fail", help="Stale partial output: fail, quarantine, or delete."
+    ),
+    summary: Optional[Path] = typer.Option(None, help="Write atomic JSON batch summary."),
+    force_summary: bool = typer.Option(False, help="Replace only an existing summary report."),
     extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
     yes: bool = typer.Option(
         False, "--yes", "-y", help="Skip final confirmation; unresolved originals still fail."
@@ -314,8 +335,15 @@ def run_batch(
 ) -> None:
     """Review and execute a safe batch conversion."""
     executable = find_executable("HandBrakeCLI", handbrake)
-    if not executable:
-        console.print("[red]Error:[/] HandBrakeCLI not found. Run `brakesmith doctor`.")
+    ffprobe_executable = find_executable("ffprobe", ffprobe)
+    if not executable or not ffprobe_executable:
+        console.print("[red]Error:[/] HandBrakeCLI or ffprobe not found. Run `brakesmith doctor`.")
+        raise typer.Exit(2)
+    if invalid_existing not in {"fail", "quarantine"}:
+        console.print("[red]Error:[/] --invalid-existing must be fail or quarantine")
+        raise typer.Exit(2)
+    if stale_partial not in {"fail", "quarantine", "delete"}:
+        console.print("[red]Error:[/] --stale-partial must be fail, quarantine, or delete")
         raise typer.Exit(2)
     try:
         items = [
@@ -382,6 +410,7 @@ def run_batch(
     failures = 0
     completed = 0
     skipped = 0
+    summary_entries: list[dict[str, object]] = []
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def request_cancel(signum: int, frame: object) -> None:
@@ -402,15 +431,77 @@ def run_batch(
                 ensure_source_unchanged(snapshots[item.path])
                 partial = destination.with_name(destination.name + ".part")
                 if destination.exists():
-                    console.print(f"[yellow]Skip:[/] {destination} exists")
-                    skipped += 1
-                    progress.advance(total_task)
-                    continue
+                    try:
+                        validate_output(
+                            destination,
+                            ffprobe_executable,
+                            item.duration,
+                            len(selected_audio[item.path]),
+                            len(selected_subtitles[item.path]),
+                        )
+                        console.print(f"[yellow]Skip:[/] Valid output exists: {destination}")
+                        skipped += 1
+                        summary_entries.append(
+                            {
+                                "source": str(item.path),
+                                "output": str(destination),
+                                "status": "skipped-valid",
+                            }
+                        )
+                    except BrakeSmithError as error:
+                        if invalid_existing == "quarantine":
+                            quarantined = quarantine_file(destination, "invalid")
+                            console.print(f"[yellow]Quarantined:[/] {quarantined} ({error})")
+                        else:
+                            failures += 1
+                            console.print(f"[red]Failed:[/] Existing output is invalid: {error}")
+                            summary_entries.append(
+                                {
+                                    "source": str(item.path),
+                                    "output": str(destination),
+                                    "status": "failed",
+                                    "error": str(error),
+                                }
+                            )
+                            progress.advance(total_task)
+                            continue
+                    if destination.exists():
+                        progress.advance(total_task)
+                        continue
                 if partial.exists():
-                    cleanup_error = cleanup_partial(partial)
-                    if cleanup_error:
-                        raise BrakeSmithError(cleanup_error)
-                    console.print(f"[yellow]Cleaned stale partial:[/] {partial}")
+                    try:
+                        validate_output(
+                            partial,
+                            ffprobe_executable,
+                            item.duration,
+                            len(selected_audio[item.path]),
+                            len(selected_subtitles[item.path]),
+                        )
+                        classification = "valid"
+                    except BrakeSmithError:
+                        classification = "invalid"
+                    if stale_partial == "fail":
+                        failures += 1
+                        message = f"Stale {classification} partial requires --stale-partial quarantine or delete: {partial}"
+                        console.print(f"[red]Failed:[/] {message}")
+                        summary_entries.append(
+                            {
+                                "source": str(item.path),
+                                "output": str(destination),
+                                "status": "failed",
+                                "error": message,
+                            }
+                        )
+                        progress.advance(total_task)
+                        continue
+                    if stale_partial == "quarantine":
+                        quarantined = quarantine_file(partial, f"stale-{classification}")
+                        console.print(f"[yellow]Quarantined stale partial:[/] {quarantined}")
+                    else:
+                        cleanup_error = cleanup_partial(partial)
+                        if cleanup_error:
+                            raise BrakeSmithError(cleanup_error)
+                        console.print(f"[yellow]Deleted stale partial:[/] {partial}")
                 file_task = progress.add_task(item.path.name, total=100)
                 command = handbrake_command(
                     executable,
@@ -425,6 +516,7 @@ def run_batch(
                     extra_subtitles[item.path],
                 )
                 process: Optional[subprocess.Popen[str]] = None
+                diagnostics: list[str] = []
                 try:
                     process = subprocess.Popen(
                         command,
@@ -435,14 +527,29 @@ def run_batch(
                     )
                     assert process.stdout is not None
                     for line in process.stdout:
+                        diagnostics.append(line)
                         match = progress_pattern.search(line)
                         if match:
                             progress.update(file_task, completed=min(float(match.group(1)), 100))
                     if process.wait() != 0:
                         raise BrakeSmithError(f"HandBrake failed for {item.path.name}")
                     ensure_source_unchanged(snapshots[item.path])
+                    validate_output(
+                        partial,
+                        ffprobe_executable,
+                        item.duration,
+                        len(selected_audio[item.path]),
+                        len(selected_subtitles[item.path]),
+                    )
                     partial.replace(destination)
                     completed += 1
+                    summary_entries.append(
+                        {
+                            "source": str(item.path),
+                            "output": str(destination),
+                            "status": "completed",
+                        }
+                    )
                     progress.update(file_task, completed=100)
                 except KeyboardInterrupt:
                     terminate_process(process)
@@ -452,12 +559,49 @@ def run_batch(
                     )
                     if cleanup_error:
                         console.print(f"[red]Warning:[/] {cleanup_error}")
+                    summary_entries.append(
+                        {
+                            "source": str(item.path),
+                            "output": str(destination),
+                            "status": "cancelled",
+                        }
+                    )
+                    if summary:
+                        try:
+                            atomic_write_json(summary, summary_entries, force_summary)
+                        except BrakeSmithError as error:
+                            console.print(f"[red]Warning:[/] {error}")
                     raise typer.Exit(130)
                 except Exception as error:  # noqa: BLE001 - cleanup must cover filesystem failures
                     terminate_process(process)
-                    cleanup_error = cleanup_partial(partial)
+                    quarantined: Optional[Path] = None
+                    if partial.exists():
+                        try:
+                            quarantined = quarantine_file(partial, "invalid")
+                        except BrakeSmithError:
+                            quarantined = None
+                    cleanup_error = cleanup_partial(partial) if partial.exists() else None
                     failures += 1
                     console.print(f"[red]Failed:[/] {error}")
+                    log_path: Optional[Path] = None
+                    if diagnostics:
+                        try:
+                            log_path = write_failure_log(destination, diagnostics)
+                            console.print(f"[yellow]HandBrake log:[/] {log_path}")
+                        except OSError as log_error:
+                            console.print(
+                                f"[red]Warning:[/] Cannot save HandBrake log: {log_error}"
+                            )
+                    summary_entries.append(
+                        {
+                            "source": str(item.path),
+                            "output": str(destination),
+                            "status": "failed",
+                            "error": str(error),
+                            "quarantined": str(quarantined) if quarantined else None,
+                            "log": str(log_path) if log_path else None,
+                        }
+                    )
                     if cleanup_error:
                         console.print(f"[red]Warning:[/] {cleanup_error}")
                 finally:
@@ -469,5 +613,12 @@ def run_batch(
         f"[green]Done:[/] {completed} completed, {skipped} skipped, {failures} failed. "
         "Originals untouched."
     )
+    if summary:
+        try:
+            atomic_write_json(summary, summary_entries, force_summary)
+            console.print(f"[green]Summary:[/] {summary.resolve()}")
+        except BrakeSmithError as error:
+            console.print(f"[red]Summary failed:[/] {error}")
+            failures += 1
     if failures:
         raise typer.Exit(1)

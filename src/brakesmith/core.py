@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,6 +128,69 @@ def preflight_destination(destination: Path, expected_bytes: int) -> None:
         raise BrakeSmithError(
             f"Insufficient free space for {destination}: need at least {required} bytes, have {free}"
         )
+
+
+def validate_output(
+    path: Path,
+    ffprobe: str,
+    source_duration: float,
+    expected_audio: int,
+    expected_subtitles: int,
+) -> MediaFile:
+    if not path.is_file() or path.stat().st_size < 1024:
+        raise BrakeSmithError(f"Output is missing or too small: {path}")
+    media = probe(path, ffprobe)
+    if media.codec not in {"hevc", "h265"}:
+        raise BrakeSmithError(f"Output video is {media.codec}, expected HEVC: {path}")
+    tolerance = max(5.0, source_duration * 0.01)
+    if source_duration and abs(media.duration - source_duration) > tolerance:
+        raise BrakeSmithError(
+            f"Output duration differs by {abs(media.duration - source_duration):.2f}s: {path}"
+        )
+    if len(media.audio) != expected_audio:
+        raise BrakeSmithError(
+            f"Output has {len(media.audio)} audio tracks, expected {expected_audio}: {path}"
+        )
+    if len(media.subtitles) != expected_subtitles:
+        raise BrakeSmithError(
+            f"Output has {len(media.subtitles)} subtitle tracks, expected {expected_subtitles}: {path}"
+        )
+    return media
+
+
+def quarantine_file(path: Path, label: str = "invalid") -> Path:
+    candidate = path.with_name(f"{path.name}.{label}")
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.{label}.{counter}")
+        counter += 1
+    try:
+        path.replace(candidate)
+    except OSError as error:
+        raise BrakeSmithError(f"Cannot quarantine {path}: {error}") from error
+    return candidate
+
+
+def atomic_write_json(path: Path, payload: object, force: bool = False) -> None:
+    path = path.expanduser().resolve()
+    if path.exists() and not force:
+        raise BrakeSmithError(f"Report exists: {path}; pass --force to replace it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except OSError as error:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+        raise BrakeSmithError(f"Cannot write report {path}: {error}") from error
 
 
 def normalize_languages(values: Iterable[str]) -> list[str]:
