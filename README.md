@@ -34,6 +34,7 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 - Existing output is skipped, making interrupted batches safe to resume.
 - Same-directory temporary output works on mounted SMB shares without cross-filesystem moves.
 - JSON scan output for automation.
+- Complete conversion-candidate exports in JSON, CSV, or plain text.
 - Custom extensions for unusual HandBrake-compatible containers.
 - Standalone executable artifacts built for macOS, Windows, and Linux.
 
@@ -150,6 +151,8 @@ brakesmith run "/path/to/videos" --audio fra,eng --keep-original --original-lang
 | `brakesmith doctor` | Check HandBrakeCLI and ffprobe. |
 | `brakesmith scan [DIRECTORY]` | Inventory all supported videos. Defaults to `.`. |
 | `brakesmith scan --json` | Emit machine-readable inventory. |
+| `brakesmith candidates [DIRECTORY]` | Show only videos not already encoded as HEVC. |
+| `brakesmith candidates --output candidates.csv` | Save a complete reviewable conversion list. |
 | `brakesmith run [DIRECTORY]` | Review, reconcile, and convert a batch. |
 | `brakesmith --version` | Print installed version. |
 
@@ -167,6 +170,16 @@ Add an uncommon container extension without changing source code:
 brakesmith scan . --extensions divx,video
 brakesmith run . --extensions divx,video
 ```
+
+Export every relevant file before planning a large batch:
+
+```sh
+brakesmith candidates "/Volumes/Media" --output candidates.csv
+brakesmith candidates "/Volumes/Media" --output candidates.json
+brakesmith candidates "/Volumes/Media" --output candidates.txt
+```
+
+Reports are never overwritten unless `--force` is explicit. This affects only the report, never media.
 
 Quality examples:
 

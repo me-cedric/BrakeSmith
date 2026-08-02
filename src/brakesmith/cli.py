@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import subprocess
@@ -90,6 +92,19 @@ def render(media: list[MediaFile], root: Path) -> None:
     )
 
 
+def media_payload(item: MediaFile) -> dict[str, object]:
+    return {
+        "path": str(item.path),
+        "codec": item.codec,
+        "should_convert": item.should_convert,
+        "duration": item.duration,
+        "size": item.size,
+        "original_language": item.original_language,
+        "audio": [vars(track) for track in item.audio],
+        "subtitles": [vars(track) for track in item.subtitles],
+    }
+
+
 @app.command()
 def scan(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
@@ -107,22 +122,63 @@ def scan(
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
     if json_output:
-        payload = [
-            {
-                "path": str(m.path),
-                "codec": m.codec,
-                "should_convert": m.should_convert,
-                "duration": m.duration,
-                "size": m.size,
-                "original_language": m.original_language,
-                "audio": [vars(t) for t in m.audio],
-                "subtitles": [vars(t) for t in m.subtitles],
-            }
-            for m in items
-        ]
+        payload = [media_payload(item) for item in items]
         console.print_json(json.dumps(payload))
     else:
         render(items, directory)
+
+
+@app.command()
+def candidates(
+    directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
+    depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
+    output: Optional[Path] = typer.Option(None, help="Write complete .json, .csv, or .txt list."),
+    force: bool = typer.Option(False, help="Replace an existing report, never media."),
+    extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
+    ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
+) -> None:
+    """List only files whose video codec is not already HEVC."""
+    try:
+        items = [
+            item for item in inspect(directory, depth, ffprobe, extensions) if item.should_convert
+        ]
+        if output:
+            output = output.expanduser().resolve()
+            if output.exists() and not force:
+                raise BrakeSmithError(f"Report exists: {output}; pass --force to replace it")
+            suffix = output.suffix.lower()
+            if suffix == ".json":
+                content = json.dumps([media_payload(item) for item in items], indent=2) + "\n"
+            elif suffix == ".csv":
+                stream = io.StringIO()
+                writer = csv.writer(stream)
+                writer.writerow(
+                    ["path", "codec", "duration_seconds", "size_bytes", "audio", "subtitles"]
+                )
+                for item in items:
+                    writer.writerow(
+                        [
+                            item.path,
+                            item.codec,
+                            item.duration,
+                            item.size,
+                            ",".join(track.language for track in item.audio),
+                            ",".join(track.language for track in item.subtitles),
+                        ]
+                    )
+                content = stream.getvalue()
+            elif suffix == ".txt":
+                content = "".join(f"{item.path}\n" for item in items)
+            else:
+                raise BrakeSmithError("Report extension must be .json, .csv, or .txt")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(content, encoding="utf-8")
+            console.print(f"[green]Saved:[/] {len(items)} conversion candidate(s) to {output}")
+        else:
+            render(items, directory)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
 
 
 @app.command()
