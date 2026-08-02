@@ -815,49 +815,62 @@ def execute_plan(
                             }
                         else:
                             if partial.exists():
-                                raise BrakeSmithError(
-                                    f"Stale partial blocks planned execution: {partial}"
+                                ensure_source_unchanged(snapshot)
+                                validate_output(
+                                    partial,
+                                    ffprobe_executable,
+                                    duration,
+                                    expected_audio,
+                                    expected_subtitles,
+                                    int(item.get("chapters", 0)),
                                 )
-                            preflight_destination(destination, snapshot.size)
-                            command = item["command"]
-                            if not isinstance(command, list) or not all(
-                                isinstance(value, str) for value in command
-                            ):
-                                raise BrakeSmithError(f"Invalid planned command for {source}")
-                            process = subprocess.Popen(
-                                command,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                text=True,
-                                errors="replace",
-                            )
-                            assert process.stdout is not None
-                            for line in process.stdout:
-                                diagnostics.append(line)
-                                match = progress_pattern.search(line)
-                                if match:
-                                    percent = min(float(match.group(1)), 100)
-                                    progress.update(file_task, completed=percent)
-                                    progress.update(
-                                        total_task,
-                                        completed=completed_weight + weight * percent / 100,
-                                    )
-                            if process.wait() != 0:
-                                raise BrakeSmithError(f"HandBrake failed for {source.name}")
-                            ensure_source_unchanged(snapshot)
-                            validate_output(
-                                partial,
-                                ffprobe_executable,
-                                duration,
-                                expected_audio,
-                                expected_subtitles,
-                                int(item.get("chapters", 0)),
-                            )
-                            partial.replace(destination)
-                            statuses[str(source)] = {
-                                "status": "completed",
-                                "output": str(destination),
-                            }
+                                partial.replace(destination)
+                                statuses[str(source)] = {
+                                    "status": "completed",
+                                    "output": str(destination),
+                                    "recovered_partial": True,
+                                }
+                            else:
+                                preflight_destination(destination, snapshot.size)
+                                command = item["command"]
+                                if not isinstance(command, list) or not all(
+                                    isinstance(value, str) for value in command
+                                ):
+                                    raise BrakeSmithError(f"Invalid planned command for {source}")
+                                process = subprocess.Popen(
+                                    command,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    text=True,
+                                    errors="replace",
+                                )
+                                assert process.stdout is not None
+                                for line in process.stdout:
+                                    diagnostics.append(line)
+                                    match = progress_pattern.search(line)
+                                    if match:
+                                        percent = min(float(match.group(1)), 100)
+                                        progress.update(file_task, completed=percent)
+                                        progress.update(
+                                            total_task,
+                                            completed=completed_weight + weight * percent / 100,
+                                        )
+                                if process.wait() != 0:
+                                    raise BrakeSmithError(f"HandBrake failed for {source.name}")
+                                ensure_source_unchanged(snapshot)
+                                validate_output(
+                                    partial,
+                                    ffprobe_executable,
+                                    duration,
+                                    expected_audio,
+                                    expected_subtitles,
+                                    int(item.get("chapters", 0)),
+                                )
+                                partial.replace(destination)
+                                statuses[str(source)] = {
+                                    "status": "completed",
+                                    "output": str(destination),
+                                }
                         progress.update(file_task, completed=100)
                     except KeyboardInterrupt:
                         terminate_process(process)

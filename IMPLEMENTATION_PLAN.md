@@ -84,14 +84,14 @@ Checked items are implemented, reviewed, and committed. Each stage receives a pa
 
 ## v0.4.0 — Acceptance and release
 
-- [ ] Run lint and focused regression suite
-- [ ] Run local multilingual full conversion
-- [ ] Run live SMB inventory from cache twice and compare results
-- [ ] Back up one non-HEVC SMB source locally and verify checksum
-- [ ] Fully convert that SMB source
-- [ ] Validate source unchanged and output integrity
-- [ ] Remove backup only after verification
-- [ ] Update README and migration notes
+- [x] Run lint and focused regression suite
+- [x] Run local multilingual full conversion
+- [x] Run live SMB inventory from cache twice and compare results
+- [x] Back up one non-HEVC SMB source locally and verify checksum
+- [x] Fully convert that SMB source
+- [x] Validate source unchanged and output integrity
+- [x] Remove backup only after verification
+- [x] Update README and migration notes
 - [ ] Tag consolidated `v0.4.0` release
 - [ ] Push commits and tags to GitHub
 
@@ -107,6 +107,16 @@ These remain planned after v0.4 because they require deeper media-specific work 
 - [ ] Multi-title DVD/Blu-ray and multi-angle handling
 - [ ] Pause/resume inside a single HandBrake encode
 - [ ] Optional controlled source replacement; disabled by default
+- [ ] Stream very large reports instead of retaining all inventory objects
+- [ ] Support multiple roots in one plan
+- [ ] Add bounded retries and rate limiting for transient SMB failures
+- [ ] Add directory-first estimates before probing every file
+- [ ] Add source/output size prediction and VMAF/SSIM sample checks
+- [ ] Preserve filesystem timestamps and selected container metadata on output
+- [ ] Embed selected external subtitle sidecars and copy required font attachments
+- [ ] Add verified local-staging-to-SMB transfer workflow
+- [ ] Add bandwidth limits, scheduling windows, completion notifications, and hooks
+- [ ] Add source-aware quality recommendations and crop previews
 
 ## Explicitly excluded for now
 

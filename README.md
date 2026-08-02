@@ -35,6 +35,13 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 - Same-directory temporary output works on mounted SMB shares without cross-filesystem moves.
 - JSON scan output for automation.
 - Complete conversion-candidate exports in JSON, CSV, or plain text.
+- Concurrent metadata probing with local change-aware cache and timeouts.
+- Immutable reviewed plans with exact source identity and collision checks.
+- Atomic execution journals, restart/resume, failed-only retry, and stop controls.
+- Output validation before publication: codec, duration, tracks, chapters, and readability.
+- Source identity checks before and after every encode.
+- HDR, Dolby Vision, color, interlace, attachment, sidecar, and track-flag inspection.
+- Compact/detailed views, grouped summaries, filters, and named TOML profiles.
 - Custom extensions for unusual HandBrake-compatible containers.
 - Standalone executable artifacts built for macOS, Windows, and Linux.
 
@@ -42,10 +49,13 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 
 - Source files are never deleted, moved, renamed, or modified.
 - Final output appears only after a successful encode.
-- Partial output uses `.brakesmith.mkv.part` and is deleted on cancellation or failure.
-- Existing destination files are never overwritten.
+- Partial output uses `.brakesmith.mkv.part`; cancellation cleans it and invalid output is quarantined.
+- Existing destination files are validated and never silently overwritten.
+- Source size, modification time, device, and inode are rechecked before and after encoding.
+- Output appears under its final name only after independent ffprobe validation.
+- Missing audio, path collisions, insufficient space, edited plans, and changed sources fail safely.
 - Batch execution requires review and confirmation unless `--yes` is used.
-- `--yes --keep-original` refuses ambiguous files unless `--original-language` resolves them.
+- `--non-interactive` controls prompts separately from `--yes` confirmation bypass.
 
 After inspecting results, remove originals yourself. BrakeSmith deliberately has no destructive replace mode.
 
@@ -153,6 +163,9 @@ brakesmith run "/path/to/videos" --audio fra,eng --keep-original --original-lang
 | `brakesmith scan --json` | Emit machine-readable inventory. |
 | `brakesmith candidates [DIRECTORY]` | Show only videos not already encoded as HEVC. |
 | `brakesmith candidates --output candidates.csv` | Save a complete reviewable conversion list. |
+| `brakesmith plan --output batch.json` | Create a sealed, non-destructive execution plan. |
+| `brakesmith dry-run --output batch.json` | Alias for `plan`. |
+| `brakesmith execute batch.json` | Execute or resume a plan using atomic state. |
 | `brakesmith run [DIRECTORY]` | Review, reconcile, and convert a batch. |
 | `brakesmith --version` | Print installed version. |
 
@@ -180,6 +193,64 @@ brakesmith candidates "/Volumes/Media" --output candidates.txt
 ```
 
 Reports are never overwritten unless `--force` is explicit. This affects only the report, never media.
+
+Large cached inventory:
+
+```sh
+brakesmith candidates "/Volumes/Media" \
+  --cache-file "$HOME/.cache/brakesmith/media.json" \
+  --workers 2 --probe-timeout 60 \
+  --exclude "Extras/*,Samples/*" \
+  --output candidates.csv
+```
+
+Two workers is a conservative SMB default. The second unchanged scan uses cached metadata.
+
+## Reviewed plans and resume
+
+Create a plan without encoding:
+
+```sh
+brakesmith plan "/Volumes/Media/Movies" \
+  --output movie-batch.json \
+  --output-directory "$HOME/BrakeSmith Output" \
+  --audio fra,eng \
+  --unknown-audio language:eng \
+  --unknown-subtitles drop \
+  --no-keep-original \
+  --non-interactive
+```
+
+Execute or resume it:
+
+```sh
+brakesmith execute movie-batch.json
+brakesmith execute movie-batch.json --stop-after-current
+brakesmith execute movie-batch.json --retry-failed --max-failures 0
+```
+
+Plans include a digest and exact source identity. Editing a plan, changing a source, or using mismatched state is refused. State is saved beside the plan after every file.
+
+Exit codes: `0` success, `1` batch failure, `2` configuration/preflight failure, `130` cancellation.
+
+## Profiles
+
+Example `~/.config/brakesmith/config.toml`:
+
+```toml
+[profiles.archive]
+audio = "fra,eng"
+subtitles = "fra,eng"
+unknown_audio = "language:eng"
+unknown_subtitles = "drop"
+quality = 18
+preset = "slow"
+bit_depth = 10
+workers = 2
+probe_timeout = 60
+```
+
+Use it with `brakesmith plan ... --profile archive` or `brakesmith run ... --profile archive`. Explicit CLI values win over profile defaults.
 
 Quality examples:
 
@@ -219,13 +290,17 @@ BrakeSmith uses stream/container language tags reported by ffprobe. ISO-639 code
 
 When `--keep-original` is active and container metadata does not identify the original language, interactive runs ask once per affected file. Non-interactive runs fail safely until you pass `--original-language CODE` or `--no-keep-original`.
 
-Tracks tagged `und` are never silently guessed. Interactive runs ask whether to keep each one. Automated runs must set `--unknown-audio keep|drop` and `--unknown-subtitles keep|drop`; unresolved `ask` policies fail safely with `--yes`.
+Tracks tagged `und` are never silently guessed. Interactive runs ask whether to keep each one. Automated runs must set `--unknown-audio keep|drop|language:CODE` and `--unknown-subtitles keep|drop|language:CODE`; unresolved `ask` policies fail safely with `--non-interactive`.
+
+Commentary and descriptive tracks are excluded by title by default. Use `--keep-commentary`, `--forced-subtitles-only`, `--exclude-titles`, or per-file plan overrides when needed.
 
 Inspect and fix incorrect tags with a tool such as MKVToolNix before a large batch.
 
 ## Output
 
 `movie.mp4` becomes `movie.brakesmith.mkv`. Existing outputs are skipped. Use `--output-directory` to mirror the input tree elsewhere.
+
+Existing outputs are skipped only after successful validation. Invalid files require an explicit `--invalid-existing quarantine` policy. Stale partial files default to failure and require an explicit policy.
 
 MKV is intentional: it supports more audio and subtitle formats than MP4, reducing conversions and information loss.
 

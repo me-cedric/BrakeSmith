@@ -399,7 +399,10 @@ def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFil
         attachments=sum(
             stream.get("codec_type") == "attachment" for stream in data.get("streams", [])
         ),
-        chapters=len(data.get("chapters", [])),
+        chapters=sum(
+            float(chapter.get("end_time", 0)) - float(chapter.get("start_time", 0)) >= 1.0
+            for chapter in data.get("chapters", [])
+        ),
         sidecars=sidecars,
     )
 
@@ -416,7 +419,7 @@ class ProbeCache:
         self.entries: dict[str, dict[str, object]] = {}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            if payload.get("version") == 2 and isinstance(payload.get("entries"), dict):
+            if payload.get("version") == 3 and isinstance(payload.get("entries"), dict):
                 self.entries = payload["entries"]
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
@@ -485,7 +488,7 @@ class ProbeCache:
         }
 
     def save(self) -> None:
-        atomic_write_json(self.path, {"version": 2, "entries": self.entries}, force=True)
+        atomic_write_json(self.path, {"version": 3, "entries": self.entries}, force=True)
 
 
 def select_tracks(
