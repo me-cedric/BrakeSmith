@@ -72,15 +72,15 @@ Checked items are implemented, reviewed, and committed. Each stage receives a pa
 
 ## v0.3.6 — Large-library UX
 
-- [ ] Add compact, detailed, and machine-readable views
-- [ ] Add grouped summaries by codec, resolution, and HDR state
-- [ ] Explain candidate/skip reasons
-- [ ] Add named TOML profiles and configuration precedence
-- [ ] Add one-answer-for-all reconciliation controls
-- [ ] Separate `--non-interactive` from confirmation bypass
-- [ ] Show complete planned paths and collision status
-- [ ] Add shell-friendly exit codes and failure report paths
-- [ ] Add paged output only when interactive
+- [x] Add compact, detailed, and machine-readable views
+- [x] Add grouped summaries by codec, resolution, and HDR state
+- [x] Explain candidate/skip reasons
+- [x] Add named TOML profiles and configuration precedence
+- [x] Add one-answer-for-all reconciliation controls
+- [x] Separate `--non-interactive` from confirmation bypass
+- [x] Show complete planned paths and collision status
+- [x] Add shell-friendly exit codes and failure report paths
+- [x] Add paged output only when interactive
 
 ## v0.4.0 — Acceptance and release
 

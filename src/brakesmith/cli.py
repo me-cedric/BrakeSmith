@@ -6,6 +6,7 @@ import json
 import re
 import signal
 import subprocess
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -19,6 +20,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from . import __version__
+from .config import load_profile, prefer_profile
 from .core import (
     BrakeSmithError,
     MediaFile,
@@ -151,30 +153,86 @@ def inspect(
     return sorted(media, key=lambda item: str(item.path).lower())
 
 
-def render(media: list[MediaFile], root: Path) -> None:
+def render(media: list[MediaFile], root: Path, view: str = "detailed") -> None:
+    if view not in {"compact", "detailed"}:
+        raise BrakeSmithError("View must be compact or detailed")
     table = Table(title=f"BrakeSmith scan · {root.resolve()}", show_lines=False)
     table.add_column("Status")
     table.add_column("File", overflow="fold")
     table.add_column("Codec")
-    table.add_column("Audio")
-    table.add_column("Subtitles")
-    table.add_column("Size", justify="right")
+    table.add_column("Video")
+    if view == "detailed":
+        table.add_column("Audio")
+        table.add_column("Subtitles")
+        table.add_column("Size", justify="right")
+    else:
+        table.add_column("Reason")
     for item in media:
-        audio = ", ".join(f"{t.type_index}:{t.language}" for t in item.audio) or "—"
-        subs = ", ".join(f"{t.type_index}:{t.language}" for t in item.subtitles) or "—"
+
+        def track_label(track: object) -> str:
+            flags = "".join(
+                [
+                    "D" if track.default else "",
+                    "F" if track.forced else "",
+                    "C" if track.commentary else "",
+                    "H" if track.hearing_impaired else "",
+                ]
+            )
+            return (
+                f"{track.type_index}:{track.language}/{track.codec}{f'[{flags}]' if flags else ''}"
+            )
+
+        audio = ", ".join(track_label(track) for track in item.audio) or "—"
+        subs = ", ".join(track_label(track) for track in item.subtitles) or "—"
         status = "[cyan]convert[/]" if item.should_convert else "[green]HEVC[/]"
-        table.add_row(
-            status,
-            str(item.path.relative_to(root.resolve())),
-            item.codec,
-            audio,
-            subs,
-            f"{item.size / 1_073_741_824:.2f} GB",
-        )
+        video = f"{item.width}×{item.height}" if item.width and item.height else "unknown"
+        if item.dolby_vision:
+            video += " DV"
+        elif item.hdr:
+            video += " HDR"
+        relative = str(item.path.relative_to(root.resolve()))
+        if view == "detailed":
+            table.add_row(
+                status,
+                relative,
+                item.codec,
+                video,
+                audio,
+                subs,
+                f"{item.size / 1_073_741_824:.2f} GB",
+            )
+        else:
+            reason = "video codec is not HEVC" if item.should_convert else "already HEVC"
+            table.add_row(status, relative, item.codec, video, reason)
     console.print(table)
+    groups = Counter(
+        (
+            item.codec,
+            f"{item.width}x{item.height}" if item.width and item.height else "unknown",
+            "DV" if item.dolby_vision else "HDR" if item.hdr else "SDR",
+        )
+        for item in media
+    )
+    if groups:
+        console.print(
+            "[dim]Groups: "
+            + "; ".join(
+                f"{codec}/{resolution}/{dynamic_range}: {count}"
+                for (codec, resolution, dynamic_range), count in sorted(groups.items())
+            )
+            + "[/]"
+        )
     console.print(
         f"[bold]{len(media)}[/] video(s), [bold cyan]{sum(m.should_convert for m in media)}[/] need conversion"
     )
+
+
+def display(media: list[MediaFile], root: Path, view: str, pager: bool = False) -> None:
+    if pager and console.is_terminal:
+        with console.pager(styles=True):
+            render(media, root, view)
+    else:
+        render(media, root, view)
 
 
 def media_payload(item: MediaFile) -> dict[str, object]:
@@ -244,6 +302,8 @@ def scan(
         -1, help="Subdirectory depth; -1 means recursive, 0 means this directory only."
     ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+    view: str = typer.Option("detailed", help="compact or detailed table."),
+    pager: bool = typer.Option(False, help="Page interactive table output."),
     extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
     workers: int = typer.Option(2, min=1, max=32, help="Concurrent metadata probes."),
     probe_timeout: float = typer.Option(60, min=1, help="Seconds allowed per metadata probe."),
@@ -266,7 +326,7 @@ def scan(
         payload = [media_payload(item) for item in items]
         typer.echo(json.dumps(payload, indent=2))
     else:
-        render(items, directory)
+        display(items, directory, view, pager)
 
 
 @app.command()
@@ -287,6 +347,8 @@ def candidates(
     min_duration: float = typer.Option(0, min=0, help="Minimum duration in seconds."),
     max_duration: float = typer.Option(0, min=0, help="Maximum duration; 0 disables."),
     codecs: str = typer.Option("", help="Comma-separated source codecs to include."),
+    view: str = typer.Option("compact", help="compact or detailed table."),
+    pager: bool = typer.Option(False, help="Page interactive table output."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
 ) -> None:
     """List only files whose video codec is not already HEVC."""
@@ -322,7 +384,7 @@ def candidates(
             write_candidates_report(items, output, force)
             console.print(f"[green]Saved:[/] {len(items)} conversion candidate(s) to {output}")
         else:
-            render(items, directory)
+            display(items, directory, view, pager)
     except ScanInterrupted as error:
         if output:
             partial = output.with_name(f"{output.stem}.partial{output.suffix}")
@@ -452,12 +514,34 @@ def plan_batch(
     probe_timeout: float = typer.Option(60, min=1),
     cache: Optional[Path] = typer.Option(None, "--cache-file"),
     use_cache: bool = typer.Option(True, "--cache/--no-cache"),
-    yes: bool = typer.Option(False, "--yes", "-y"),
+    non_interactive: bool = typer.Option(
+        False, help="Forbid all prompts; unresolved choices fail."
+    ),
+    profile: Optional[str] = typer.Option(None, help="Named TOML profile."),
+    config: Optional[Path] = typer.Option(None, help="TOML config path."),
     force: bool = typer.Option(False, help="Replace only an existing plan."),
     handbrake: Optional[Path] = typer.Option(None),
     ffprobe: Optional[Path] = typer.Option(None),
 ) -> None:
     """Create a reviewed, immutable batch plan without encoding."""
+    try:
+        profile_settings = load_profile(profile, config)
+        audio = str(prefer_profile(profile_settings, "audio", audio, "fra,eng"))
+        subtitles = str(prefer_profile(profile_settings, "subtitles", subtitles, "fra,eng"))
+        unknown_audio = str(prefer_profile(profile_settings, "unknown_audio", unknown_audio, "ask"))
+        unknown_subtitles = str(
+            prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
+        )
+        quality = float(prefer_profile(profile_settings, "quality", quality, 18.0))
+        preset = str(prefer_profile(profile_settings, "preset", preset, "slow"))
+        bit_depth = int(prefer_profile(profile_settings, "bit_depth", bit_depth, 10))
+        crop = str(prefer_profile(profile_settings, "crop", crop, "auto"))
+        deinterlace = str(prefer_profile(profile_settings, "deinterlace", deinterlace, "auto"))
+        workers = int(prefer_profile(profile_settings, "workers", workers, 2))
+        probe_timeout = float(prefer_profile(profile_settings, "probe_timeout", probe_timeout, 60))
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
     executable = find_executable("HandBrakeCLI", handbrake)
     ffprobe_executable = find_executable("ffprobe", ffprobe)
     if not executable or not ffprobe_executable:
@@ -481,9 +565,11 @@ def plan_batch(
         if not items:
             console.print("No conversion candidates.")
             return
-        originals = reconcile_original(items, keep_original, original_language, yes)
-        extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, yes)
-        extra_subtitles = reconcile_unknown_tracks(items, "subtitles", unknown_subtitles, yes)
+        originals = reconcile_original(items, keep_original, original_language, non_interactive)
+        extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, non_interactive)
+        extra_subtitles = reconcile_unknown_tracks(
+            items, "subtitles", unknown_subtitles, non_interactive
+        )
         audio_languages = normalize_languages(audio.split(","))
         subtitle_languages = normalize_languages(subtitles.split(","))
         excluded_titles = [value.strip() for value in exclude_titles.split(",") if value.strip()]
@@ -589,6 +675,8 @@ def plan_batch(
                 }
             )
         validate_destinations(destinations)
+        for source, destination in destinations:
+            console.print(f"[dim]{source} → {destination} · collision-free[/]")
         for item in plan_items:
             for warning in item["warnings"]:
                 console.print(f"[yellow]Warning:[/] {Path(str(item['source'])).name}: {warning}")
@@ -908,10 +996,33 @@ def run_batch(
     yes: bool = typer.Option(
         False, "--yes", "-y", help="Skip final confirmation; unresolved originals still fail."
     ),
+    non_interactive: bool = typer.Option(
+        False, help="Forbid all prompts; unresolved choices fail."
+    ),
+    profile: Optional[str] = typer.Option(None, help="Named TOML profile."),
+    config: Optional[Path] = typer.Option(None, help="TOML config path."),
     handbrake: Optional[Path] = typer.Option(None, help="Path to HandBrakeCLI."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
 ) -> None:
     """Review and execute a safe batch conversion."""
+    try:
+        profile_settings = load_profile(profile, config)
+        audio = str(prefer_profile(profile_settings, "audio", audio, "fra,eng"))
+        subtitles = str(prefer_profile(profile_settings, "subtitles", subtitles, "fra,eng"))
+        unknown_audio = str(prefer_profile(profile_settings, "unknown_audio", unknown_audio, "ask"))
+        unknown_subtitles = str(
+            prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
+        )
+        quality = float(prefer_profile(profile_settings, "quality", quality, 18.0))
+        preset = str(prefer_profile(profile_settings, "preset", preset, "slow"))
+        bit_depth = int(prefer_profile(profile_settings, "bit_depth", bit_depth, 10))
+        crop = str(prefer_profile(profile_settings, "crop", crop, "auto"))
+        deinterlace = str(prefer_profile(profile_settings, "deinterlace", deinterlace, "auto"))
+        workers = int(prefer_profile(profile_settings, "workers", workers, 2))
+        probe_timeout = float(prefer_profile(profile_settings, "probe_timeout", probe_timeout, 60))
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
     executable = find_executable("HandBrakeCLI", handbrake)
     ffprobe_executable = find_executable("ffprobe", ffprobe)
     if not executable or not ffprobe_executable:
@@ -941,9 +1052,11 @@ def run_batch(
         render(items, directory)
         if not items:
             return
-        originals = reconcile_original(items, keep_original, original_language, yes)
-        extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, yes)
-        extra_subtitles = reconcile_unknown_tracks(items, "subtitles", unknown_subtitles, yes)
+        originals = reconcile_original(items, keep_original, original_language, non_interactive)
+        extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, non_interactive)
+        extra_subtitles = reconcile_unknown_tracks(
+            items, "subtitles", unknown_subtitles, non_interactive
+        )
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
