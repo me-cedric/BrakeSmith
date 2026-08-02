@@ -4,9 +4,21 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from brakesmith import cli
-from brakesmith.core import MediaFile
+from brakesmith.core import MediaFile, Track
 
 runner = CliRunner()
+
+
+def test_delete_replaced_source_keeps_validated_output(tmp_path: Path):
+    source = tmp_path / "movie.x264.mkv"
+    destination = tmp_path / "movie.x265.mkv"
+    source.write_text("old")
+    destination.write_text("new")
+
+    cli.delete_replaced_source(source, destination)
+
+    assert not source.exists()
+    assert destination.read_text() == "new"
 
 
 def test_candidates_exports_only_non_hevc(tmp_path: Path, monkeypatch):
@@ -33,3 +45,113 @@ def test_candidates_refuses_to_replace_report(tmp_path: Path, monkeypatch):
     result = runner.invoke(cli.app, ["candidates", str(tmp_path), "--output", str(report)])
     assert result.exit_code == 2
     assert report.read_text() == "keep me"
+
+
+def test_language_picker_selects_once_for_whole_batch(tmp_path: Path, monkeypatch):
+    items = [
+        MediaFile(
+            tmp_path / "one.mkv",
+            "h264",
+            60,
+            10,
+            audio=[
+                Track(1, 1, "audio", "eng"),
+                Track(2, 2, "audio", "jpn"),
+                Track(3, 3, "audio", "und"),
+            ],
+        ),
+        MediaFile(
+            tmp_path / "two.mkv",
+            "h264",
+            60,
+            10,
+            audio=[Track(1, 1, "audio", "fra"), Track(2, 2, "audio", "jpn")],
+            subtitles=[Track(3, 1, "subtitle", "spa")],
+        ),
+    ]
+    calls = []
+
+    class Answer:
+        def __init__(self, choices):
+            self.choices = choices
+
+        def ask(self):
+            calls.append(self.choices)
+            checked = {choice.value: choice.checked for choice in self.choices}
+            assert checked == {
+                "eng": True,
+                "fra": True,
+                "jpn": False,
+                "spa": False,
+                "und": False,
+            }
+            labels = [choice.title for choice in self.choices]
+            assert any(label.startswith("Japanese —") for label in labels)
+            assert any(label.startswith("Spanish —") for label in labels)
+            return ["eng", "fra", "jpn"]
+
+    monkeypatch.setattr(
+        cli.questionary, "checkbox", lambda *args, **kwargs: Answer(kwargs["choices"])
+    )
+
+    audio, subtitles, keep_unknown_audio, keep_unknown_subtitles = cli.reconcile_languages(
+        items,
+        "eng,fra",
+        "eng,fra",
+        non_interactive=False,
+        choose_unknown_audio=True,
+        choose_unknown_subtitles=True,
+    )
+
+    assert audio == subtitles == ["eng", "fra", "jpn"]
+    assert keep_unknown_audio is False
+    assert keep_unknown_subtitles is None
+    assert len(calls) == 1
+
+
+def test_only_undefined_language_starts_selected(tmp_path: Path, monkeypatch):
+    item = MediaFile(
+        tmp_path / "unknown.mkv",
+        "h264",
+        60,
+        10,
+        audio=[Track(1, 1, "audio", "und")],
+    )
+
+    class Answer:
+        def __init__(self, choices):
+            self.choices = choices
+
+        def ask(self):
+            assert len(self.choices) == 1
+            assert self.choices[0].value == "und"
+            assert self.choices[0].checked is True
+            return ["und"]
+
+    monkeypatch.setattr(
+        cli.questionary, "checkbox", lambda *args, **kwargs: Answer(kwargs["choices"])
+    )
+
+    audio, subtitles, keep_unknown_audio, keep_unknown_subtitles = cli.reconcile_languages(
+        [item],
+        "eng,fra",
+        "eng,fra",
+        non_interactive=False,
+        choose_unknown_audio=True,
+        choose_unknown_subtitles=True,
+    )
+
+    assert audio == subtitles == []
+    assert keep_unknown_audio is True
+    assert keep_unknown_subtitles is None
+
+    audio, subtitles, keep_unknown_audio, keep_unknown_subtitles = cli.reconcile_languages(
+        [item],
+        "eng,fra",
+        "eng,fra",
+        non_interactive=True,
+        choose_unknown_audio=False,
+        choose_unknown_subtitles=False,
+    )
+    assert audio == subtitles == ["eng", "fra"]
+    assert keep_unknown_audio is keep_unknown_subtitles is None

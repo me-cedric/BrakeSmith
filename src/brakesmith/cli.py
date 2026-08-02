@@ -13,7 +13,10 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Optional
 
+import pycountry
+import questionary
 import typer
+from questionary import Choice
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -47,6 +50,7 @@ from .core import (
     preflight_destination,
     probe,
     quarantine_file,
+    replacement_output_path,
     select_tracks,
     snapshot_source,
     validate_destinations,
@@ -481,8 +485,69 @@ def reconcile_original(
     return result
 
 
+def language_name(code: str) -> str:
+    if code == "und":
+        return "Undefined"
+    language = pycountry.languages.get(alpha_3=code) or pycountry.languages.get(alpha_2=code)
+    return str(language.name) if language else code.upper()
+
+
+def reconcile_languages(
+    items: list[MediaFile],
+    configured_audio: str,
+    configured_subtitles: str,
+    non_interactive: bool,
+    choose_unknown_audio: bool,
+    choose_unknown_subtitles: bool,
+) -> tuple[list[str], list[str], Optional[bool], Optional[bool]]:
+    audio_languages = normalize_languages(configured_audio.split(","))
+    subtitle_languages = normalize_languages(configured_subtitles.split(","))
+    audio_counts = Counter(track.language for item in items for track in item.audio)
+    subtitle_counts = Counter(track.language for item in items for track in item.subtitles)
+    counts = audio_counts + subtitle_counts
+    if non_interactive or not counts:
+        return audio_languages, subtitle_languages, None, None
+
+    configured = list(dict.fromkeys([*audio_languages, *subtitle_languages]))
+    ordered = [
+        *[language for language in configured if language in counts],
+        *sorted(counts.keys() - set(configured) - {"und"}),
+    ]
+    choose_unknown = (choose_unknown_audio and "und" in audio_counts) or (
+        choose_unknown_subtitles and "und" in subtitle_counts
+    )
+    if choose_unknown:
+        ordered.append("und")
+    if not ordered:
+        return audio_languages, subtitle_languages, None, None
+    only_undefined = set(counts) == {"und"}
+    answer = questionary.checkbox(
+        "Choose languages to keep for audio and subtitles",
+        choices=[
+            Choice(
+                f"{language_name(language)} — {audio_counts[language]} audio, "
+                f"{subtitle_counts[language]} subtitle",
+                value=language,
+                checked=language in configured or (language == "und" and only_undefined),
+            )
+            for language in ordered
+        ],
+        instruction="(↑/↓ move, space toggle, enter confirm)",
+    ).ask()
+    if answer is None:
+        raise BrakeSmithError("Language selection cancelled")
+    selected = [language for language in answer if language != "und"]
+    unknown = "und" in answer
+    return (
+        selected,
+        selected,
+        unknown if choose_unknown_audio and "und" in audio_counts else None,
+        unknown if choose_unknown_subtitles and "und" in subtitle_counts else None,
+    )
+
+
 def reconcile_unknown_tracks(
-    items: list[MediaFile], kind: str, policy: str, yes: bool
+    items: list[MediaFile], kind: str, policy: str, non_interactive: bool
 ) -> dict[Path, set[int]]:
     assigned_language: Optional[str] = None
     if policy.startswith("language:"):
@@ -493,24 +558,30 @@ def reconcile_unknown_tracks(
     elif policy not in {"ask", "keep", "drop"}:
         raise BrakeSmithError(f"--unknown-{kind} must be ask, keep, drop, or language:CODE")
     result: dict[Path, set[int]] = {item.path: set() for item in items}
+    unknown = [
+        (item, track)
+        for item in items
+        for track in (item.audio if kind == "audio" else item.subtitles)
+        if track.language == "und"
+    ]
+    if policy == "ask" and unknown:
+        if non_interactive:
+            raise BrakeSmithError(
+                f"{len(unknown)} unlabelled {kind} track(s); use --unknown-{kind} keep or drop."
+            )
+        policy = (
+            "keep"
+            if Confirm.ask(
+                f"Keep all {len(unknown)} unlabelled {kind} track(s) across this batch?",
+                default=kind == "audio",
+            )
+            else "drop"
+        )
     for item in items:
         tracks = item.audio if kind == "audio" else item.subtitles
         for track in (candidate for candidate in tracks if candidate.language == "und"):
             if policy == "keep" or assigned_language:
                 result[item.path].add(track.type_index)
-            elif policy == "ask":
-                if yes:
-                    raise BrakeSmithError(
-                        f"Unlabelled {kind} track {track.type_index} in {item.path}; "
-                        f"use --unknown-{kind} keep or drop."
-                    )
-                label = f" ({track.title})" if track.title else ""
-                if Confirm.ask(
-                    f"Keep unlabelled {kind} track {track.type_index}{label} in "
-                    f"[bold]{item.path.name}[/]?",
-                    default=False,
-                ):
-                    result[item.path].add(track.type_index)
     return result
 
 
@@ -519,8 +590,8 @@ def plan_batch(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
     output: Path = typer.Option(..., help="Destination .json plan."),
     depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
-    audio: str = typer.Option("fra,eng", help="Audio languages to keep."),
-    subtitles: str = typer.Option("fra,eng", help="Subtitle languages to keep."),
+    audio: str = typer.Option("eng,fra", help="Audio languages to keep."),
+    subtitles: str = typer.Option("eng,fra", help="Subtitle languages to keep."),
     unknown_audio: str = typer.Option("ask", help="Unlabelled audio: ask, keep, or drop."),
     unknown_subtitles: str = typer.Option("ask", help="Unlabelled subtitles: ask, keep, or drop."),
     keep_commentary: bool = typer.Option(False, help="Keep commentary tracks."),
@@ -528,7 +599,7 @@ def plan_batch(
     exclude_titles: str = typer.Option(
         "commentary,description", help="Track-title fragments to exclude."
     ),
-    keep_original: bool = typer.Option(True, "--keep-original/--no-keep-original"),
+    keep_original: bool = typer.Option(False, "--keep-original/--no-keep-original"),
     original_language: Optional[str] = typer.Option(None),
     quality: float = typer.Option(18.0, min=0, max=51),
     preset: str = typer.Option("slow"),
@@ -540,6 +611,11 @@ def plan_batch(
     deinterlace: str = typer.Option("auto", help="auto, off, decomb, or yadif."),
     lossless: bool = typer.Option(False, help="x265 lossless mode; output may be huge."),
     output_directory: Optional[Path] = typer.Option(None),
+    replace_source: bool = typer.Option(
+        False,
+        "--replace-source/--keep-source",
+        help="Delete each source immediately after its validated HEVC output is published.",
+    ),
     overrides: Optional[Path] = typer.Option(
         None, exists=True, dir_okay=False, help="Per-source audio_tracks/subtitle_tracks JSON."
     ),
@@ -561,8 +637,8 @@ def plan_batch(
     """Create a reviewed, immutable batch plan without encoding."""
     try:
         profile_settings = load_profile(profile, config)
-        audio = str(prefer_profile(profile_settings, "audio", audio, "fra,eng"))
-        subtitles = str(prefer_profile(profile_settings, "subtitles", subtitles, "fra,eng"))
+        audio = str(prefer_profile(profile_settings, "audio", audio, "eng,fra"))
+        subtitles = str(prefer_profile(profile_settings, "subtitles", subtitles, "eng,fra"))
         unknown_audio = str(prefer_profile(profile_settings, "unknown_audio", unknown_audio, "ask"))
         unknown_subtitles = str(
             prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
@@ -600,13 +676,28 @@ def plan_batch(
         if not items:
             console.print("No conversion candidates.")
             return
+        (
+            audio_languages,
+            subtitle_languages,
+            unknown_audio_choice,
+            unknown_subtitle_choice,
+        ) = reconcile_languages(
+            items,
+            audio,
+            subtitles,
+            non_interactive,
+            choose_unknown_audio=unknown_audio == "ask",
+            choose_unknown_subtitles=unknown_subtitles == "ask",
+        )
+        if unknown_audio_choice is not None:
+            unknown_audio = "keep" if unknown_audio_choice else "drop"
+        if unknown_subtitle_choice is not None:
+            unknown_subtitles = "keep" if unknown_subtitle_choice else "drop"
         originals = reconcile_original(items, keep_original, original_language, non_interactive)
         extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, non_interactive)
         extra_subtitles = reconcile_unknown_tracks(
             items, "subtitles", unknown_subtitles, non_interactive
         )
-        audio_languages = normalize_languages(audio.split(","))
-        subtitle_languages = normalize_languages(subtitles.split(","))
         excluded_titles = [value.strip() for value in exclude_titles.split(",") if value.strip()]
         override_map: dict[str, object] = {}
         if overrides:
@@ -628,6 +719,7 @@ def plan_batch(
                         originals[item.path],
                         keep_commentary=keep_commentary,
                         exclude_titles=excluded_titles,
+                        fallback_default=True,
                     )
                 )
                 | extra_audio[item.path]
@@ -640,6 +732,7 @@ def plan_batch(
                         keep_commentary=keep_commentary,
                         forced_only=forced_subtitles_only,
                         exclude_titles=excluded_titles,
+                        fallback_default=True,
                     )
                 )
                 | extra_subtitles[item.path]
@@ -665,7 +758,11 @@ def plan_batch(
                     raise BrakeSmithError(f"Override references missing track for {item.path}")
             if item.audio and not selected_audio and not allow_no_audio:
                 raise BrakeSmithError(f"No audio selected for {item.path}; adjust policy")
-            destination = output_path(item.path, output_directory, directory)
+            destination = (
+                replacement_output_path(item.path, output_directory, directory)
+                if replace_source
+                else output_path(item.path, output_directory, directory)
+            )
             destinations.append((item.path, destination))
             partial = destination.with_name(destination.name + ".part")
             snapshot = snapshot_source(item.path)
@@ -685,6 +782,7 @@ def plan_batch(
                     "chapters": item.chapters,
                     "audio_tracks": selected_audio,
                     "subtitle_tracks": selected_subtitles,
+                    "replace_source": replace_source,
                     "warnings": fidelity_warnings(item),
                     "command": handbrake_command(
                         executable,
@@ -731,6 +829,7 @@ def plan_batch(
                 "lossless": lossless,
                 "audio_languages": audio_languages,
                 "subtitle_languages": subtitle_languages,
+                "replace_source": replace_source,
             },
             "totals": {
                 "files": len(plan_items),
@@ -741,6 +840,10 @@ def plan_batch(
             "items": plan_items,
         }
         write_plan(output, payload, force)
+        if replace_source:
+            console.print(
+                "[bold red]Replace mode:[/] execution deletes each source after output validation."
+            )
         console.print(
             f"[green]Plan:[/] {output.resolve()} · {len(plan_items)} file(s) · "
             f"{sum(item.duration for item in items) / 3600:.1f} hours"
@@ -836,10 +939,10 @@ def execute_plan(
                             device=int(raw_snapshot["device"]),
                             inode=int(raw_snapshot["inode"]),
                         )
-                        ensure_source_unchanged(snapshot)
+                        replace_source = bool(item.get("replace_source", False))
                         expected_audio = len(item["audio_tracks"])
                         expected_subtitles = len(item["subtitle_tracks"])
-                        if destination.exists():
+                        if not source.exists() and replace_source and destination.exists():
                             validate_output(
                                 destination,
                                 ffprobe_executable,
@@ -852,6 +955,27 @@ def execute_plan(
                                 "status": "completed",
                                 "output": str(destination),
                                 "recovered": True,
+                                "source_deleted": True,
+                            }
+                            progress.update(file_task, completed=100)
+                            continue
+                        ensure_source_unchanged(snapshot)
+                        if destination.exists():
+                            validate_output(
+                                destination,
+                                ffprobe_executable,
+                                duration,
+                                expected_audio,
+                                expected_subtitles,
+                                int(item.get("chapters", 0)),
+                            )
+                            if replace_source:
+                                delete_replaced_source(source, destination)
+                            statuses[str(source)] = {
+                                "status": "completed",
+                                "output": str(destination),
+                                "recovered": True,
+                                "source_deleted": replace_source,
                             }
                         else:
                             if partial.exists():
@@ -865,10 +989,13 @@ def execute_plan(
                                     int(item.get("chapters", 0)),
                                 )
                                 partial.replace(destination)
+                                if replace_source:
+                                    delete_replaced_source(source, destination)
                                 statuses[str(source)] = {
                                     "status": "completed",
                                     "output": str(destination),
                                     "recovered_partial": True,
+                                    "source_deleted": replace_source,
                                 }
                             else:
                                 preflight_destination(destination, snapshot.size)
@@ -907,9 +1034,12 @@ def execute_plan(
                                     int(item.get("chapters", 0)),
                                 )
                                 partial.replace(destination)
+                                if replace_source:
+                                    delete_replaced_source(source, destination)
                                 statuses[str(source)] = {
                                     "status": "completed",
                                     "output": str(destination),
+                                    "source_deleted": replace_source,
                                 }
                         progress.update(file_task, completed=100)
                     except KeyboardInterrupt:
@@ -920,7 +1050,9 @@ def execute_plan(
                             "error": cleanup_error,
                         }
                         write_state(journal_path, state)
-                        console.print("\n[yellow]Cancelled.[/] State saved; source untouched.")
+                        console.print(
+                            "\n[yellow]Cancelled.[/] State saved; completed replacements remain."
+                        )
                         raise typer.Exit(130)
                     except Exception as error:  # noqa: BLE001 - durable state needs every failure
                         terminate_process(process)
@@ -982,6 +1114,15 @@ def cleanup_partial(path: Path) -> Optional[str]:
     return None
 
 
+def delete_replaced_source(source: Path, destination: Path) -> None:
+    try:
+        source.unlink()
+    except OSError as error:
+        raise BrakeSmithError(
+            f"Validated output is safe at {destination}, but source could not be deleted: {error}"
+        ) from error
+
+
 def write_failure_log(destination: Path, lines: list[str]) -> Path:
     candidate = destination.with_name(f"{destination.name}.handbrake.log")
     counter = 1
@@ -996,8 +1137,8 @@ def write_failure_log(destination: Path, lines: list[str]) -> Path:
 def run_batch(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
     depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
-    audio: str = typer.Option("fra,eng", help="Audio languages to keep (ISO codes or names)."),
-    subtitles: str = typer.Option("fra,eng", help="Subtitle languages to keep."),
+    audio: str = typer.Option("eng,fra", help="Audio languages to keep (ISO codes or names)."),
+    subtitles: str = typer.Option("eng,fra", help="Subtitle languages to keep."),
     unknown_audio: str = typer.Option("ask", help="Unlabelled audio tracks: ask, keep, or drop."),
     unknown_subtitles: str = typer.Option(
         "ask", help="Unlabelled subtitle tracks: ask, keep, or drop."
@@ -1008,9 +1149,9 @@ def run_batch(
         "commentary,description", help="Track-title fragments to exclude."
     ),
     keep_original: bool = typer.Option(
-        True,
+        False,
         "--keep-original/--no-keep-original",
-        help="Also keep detected original-language audio.",
+        help="Also keep detected original-language audio; opt-in.",
     ),
     original_language: Optional[str] = typer.Option(
         None, help="Fallback original language for files lacking metadata."
@@ -1029,6 +1170,11 @@ def run_batch(
     output_directory: Optional[Path] = typer.Option(
         None, help="Mirror results under another directory."
     ),
+    replace_source: bool = typer.Option(
+        False,
+        "--replace-source/--keep-source",
+        help="Delete each source immediately after its validated HEVC output is published.",
+    ),
     include_hevc: bool = typer.Option(False, help="Reprocess files already encoded as HEVC."),
     allow_no_audio: bool = typer.Option(
         False, help="Allow output without audio even when source has audio."
@@ -1046,9 +1192,7 @@ def run_batch(
     probe_timeout: float = typer.Option(60, min=1, help="Seconds allowed per metadata probe."),
     cache: Optional[Path] = typer.Option(None, "--cache-file", help="Local probe-cache path."),
     use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use local probe cache."),
-    yes: bool = typer.Option(
-        False, "--yes", "-y", help="Skip final confirmation; unresolved originals still fail."
-    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip final confirmation."),
     non_interactive: bool = typer.Option(
         False, help="Forbid all prompts; unresolved choices fail."
     ),
@@ -1060,8 +1204,8 @@ def run_batch(
     """Review and execute a safe batch conversion."""
     try:
         profile_settings = load_profile(profile, config)
-        audio = str(prefer_profile(profile_settings, "audio", audio, "fra,eng"))
-        subtitles = str(prefer_profile(profile_settings, "subtitles", subtitles, "fra,eng"))
+        audio = str(prefer_profile(profile_settings, "audio", audio, "eng,fra"))
+        subtitles = str(prefer_profile(profile_settings, "subtitles", subtitles, "eng,fra"))
         unknown_audio = str(prefer_profile(profile_settings, "unknown_audio", unknown_audio, "ask"))
         unknown_subtitles = str(
             prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
@@ -1102,19 +1246,34 @@ def run_batch(
             )
             if m.should_convert or include_hevc
         ]
-        render(items, directory)
         if not items:
             return
+        (
+            audio_languages,
+            subtitle_languages,
+            unknown_audio_choice,
+            unknown_subtitle_choice,
+        ) = reconcile_languages(
+            items,
+            audio,
+            subtitles,
+            non_interactive,
+            choose_unknown_audio=unknown_audio == "ask",
+            choose_unknown_subtitles=unknown_subtitles == "ask",
+        )
+        if unknown_audio_choice is not None:
+            unknown_audio = "keep" if unknown_audio_choice else "drop"
+        if unknown_subtitle_choice is not None:
+            unknown_subtitles = "keep" if unknown_subtitle_choice else "drop"
         originals = reconcile_original(items, keep_original, original_language, non_interactive)
         extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, non_interactive)
         extra_subtitles = reconcile_unknown_tracks(
             items, "subtitles", unknown_subtitles, non_interactive
         )
+        render(items, directory)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
-    audio_languages = normalize_languages(audio.split(","))
-    subtitle_languages = normalize_languages(subtitles.split(","))
     excluded_titles = [value.strip() for value in exclude_titles.split(",") if value.strip()]
     selected_audio: dict[Path, list[int]] = {}
     selected_subtitles: dict[Path, list[int]] = {}
@@ -1127,6 +1286,7 @@ def run_batch(
                     originals[item.path],
                     keep_commentary=keep_commentary,
                     exclude_titles=excluded_titles,
+                    fallback_default=True,
                 )
             )
             | extra_audio[item.path]
@@ -1139,6 +1299,7 @@ def run_batch(
                     keep_commentary=keep_commentary,
                     forced_only=forced_subtitles_only,
                     exclude_titles=excluded_titles,
+                    fallback_default=True,
                 )
             )
             | extra_subtitles[item.path]
@@ -1157,7 +1318,12 @@ def run_batch(
         for warning in fidelity_warnings(item):
             console.print(f"[yellow]Warning:[/] {item.path.name}: {warning}")
     destinations = {
-        item.path: output_path(item.path, output_directory, directory) for item in items
+        item.path: (
+            replacement_output_path(item.path, output_directory, directory)
+            if replace_source
+            else output_path(item.path, output_directory, directory)
+        )
+        for item in items
     }
     try:
         validate_destinations([(item.path, destinations[item.path]) for item in items])
@@ -1165,9 +1331,12 @@ def run_batch(
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
-    if not yes and not Confirm.ask(
-        f"Convert {len(items)} file(s)? Originals will remain untouched", default=False
-    ):
+    action = (
+        "Validated outputs will replace and permanently delete each source immediately"
+        if replace_source
+        else "Originals will remain untouched"
+    )
+    if not yes and not Confirm.ask(f"Convert {len(items)} file(s)? {action}", default=False):
         console.print("Cancelled. No files changed.")
         return
 
@@ -1215,15 +1384,6 @@ def run_batch(
                             len(selected_subtitles[item.path]),
                             item.chapters,
                         )
-                        console.print(f"[yellow]Skip:[/] Valid output exists: {destination}")
-                        skipped += 1
-                        summary_entries.append(
-                            {
-                                "source": str(item.path),
-                                "output": str(destination),
-                                "status": "skipped-valid",
-                            }
-                        )
                     except BrakeSmithError as error:
                         if invalid_existing == "quarantine":
                             quarantined = quarantine_file(destination, "invalid")
@@ -1241,7 +1401,42 @@ def run_batch(
                             )
                             progress.update(total_task, completed=file_number)
                             continue
-                    if destination.exists():
+                    else:
+                        if replace_source:
+                            try:
+                                delete_replaced_source(item.path, destination)
+                            except BrakeSmithError as error:
+                                failures += 1
+                                console.print(f"[red]Failed:[/] {error}")
+                                summary_entries.append(
+                                    {
+                                        "source": str(item.path),
+                                        "output": str(destination),
+                                        "status": "failed-source-delete",
+                                        "error": str(error),
+                                    }
+                                )
+                            else:
+                                completed += 1
+                                console.print(f"[green]Replaced:[/] {item.path} → {destination}")
+                                summary_entries.append(
+                                    {
+                                        "source": str(item.path),
+                                        "output": str(destination),
+                                        "status": "completed-existing",
+                                        "source_deleted": True,
+                                    }
+                                )
+                        else:
+                            console.print(f"[yellow]Skip:[/] Valid output exists: {destination}")
+                            skipped += 1
+                            summary_entries.append(
+                                {
+                                    "source": str(item.path),
+                                    "output": str(destination),
+                                    "status": "skipped-valid",
+                                }
+                            )
                         progress.update(total_task, completed=file_number)
                         continue
                 if partial.exists():
@@ -1336,12 +1531,15 @@ def run_batch(
                         item.chapters,
                     )
                     partial.replace(destination)
+                    if replace_source:
+                        delete_replaced_source(item.path, destination)
                     completed += 1
                     summary_entries.append(
                         {
                             "source": str(item.path),
                             "output": str(destination),
                             "status": "completed",
+                            "source_deleted": replace_source,
                         }
                     )
                     progress.update(file_task, completed=100)
@@ -1349,7 +1547,8 @@ def run_batch(
                     terminate_process(process)
                     cleanup_error = cleanup_partial(partial)
                     console.print(
-                        "\n[yellow]Cancelled.[/] Partial output cleanup attempted; originals untouched."
+                        "\n[yellow]Cancelled.[/] Current partial cleanup attempted; completed "
+                        "replacements remain."
                     )
                     if cleanup_error:
                         console.print(f"[red]Warning:[/] {cleanup_error}")
@@ -1403,9 +1602,10 @@ def run_batch(
                     progress.update(total_task, completed=file_number)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
+    source_result = "Completed sources deleted." if replace_source else "Originals untouched."
     console.print(
         f"[green]Done:[/] {completed} completed, {skipped} skipped, {failures} failed. "
-        "Originals untouched."
+        f"{source_result}"
     )
     if summary:
         try:

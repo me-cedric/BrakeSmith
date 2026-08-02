@@ -1,7 +1,7 @@
 <div align="center">
 <br />
 <h1>BrakeSmith</h1>
-<p><strong>Forge clean H.265 libraries with HandBrakeCLI—without risking originals.</strong></p>
+<p><strong>Forge clean H.265 libraries with HandBrakeCLI, with validated optional source replacement.</strong></p>
 <p>
 <a href="https://github.com/me-cedric/BrakeSmith/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/me-cedric/BrakeSmith/ci.yml?branch=main&label=CI&logo=github&style=flat" alt="CI Status" /></a>
 <a href="LICENSE"><img src="https://img.shields.io/github/license/me-cedric/BrakeSmith?style=flat" alt="MIT License" /></a>
@@ -11,9 +11,9 @@
 <br />
 </div>
 
-BrakeSmith scans a directory tree, shows every supported video, lets you reconcile uncertain language metadata, then converts selected files to 10-bit H.265 in MKV. French and English audio/subtitles are kept by default; original-language audio is kept when metadata can identify it.
+BrakeSmith scans a directory tree, asks once for languages to keep, then converts selected files to 10-bit H.265 in MKV. English and French are preselected by default; all detected languages appear by full name.
 
-It is review-first. Output is written to a temporary file, atomically renamed only after HandBrake succeeds, and never replaces the source.
+It is review-first. Output is written to a temporary file and published only after HandBrake succeeds plus independent ffprobe validation. Sources remain by default; `--replace-source` deletes each source immediately after its validated output is published.
 
 ## Features
 
@@ -22,9 +22,10 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 - Exhaustive table of supported videos, codecs, size, audio, and subtitle languages.
 - Skips files already using HEVC unless asked to reprocess them.
 - Selectable audio and subtitle languages using names or ISO codes.
-- Original-language detection from container metadata.
-- Interactive reconciliation when original-language metadata is missing.
-- Per-track reconciliation for unlabelled audio and subtitles.
+- One arrow-key language selection for audio and subtitles, using full names.
+- Default-disposition fallback when a file has none of the globally selected languages.
+- Original-language detection from container metadata when `--keep-original` is requested.
+- One batch selection for unlabelled audio and subtitles.
 - Explicit non-interactive fallback with `--original-language`.
 - H.265/x265 10-bit constant-quality encoding; conservative quality 18 and `slow` preset.
 - Audio passthrough when MKV supports the source codec, with AAC fallback.
@@ -39,6 +40,7 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 - Immutable reviewed plans with exact source identity and collision checks.
 - Atomic execution journals, restart/resume, failed-only retry, and stop controls.
 - Output validation before publication: codec, duration, tracks, chapters, and readability.
+- Optional per-file source replacement with codec-aware `x264` → `x265` / `AVC` → `HEVC` names.
 - Source identity checks before and after every encode.
 - HDR, Dolby Vision, color, interlace, attachment, sidecar, and track-flag inspection.
 - Compact/detailed views, grouped summaries, filters, and named TOML profiles.
@@ -47,17 +49,16 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 
 ## Safety model
 
-- Source files are never deleted, moved, renamed, or modified.
+- Source files remain untouched unless `--replace-source` is explicit.
 - Final output appears only after a successful encode.
-- Partial output uses `.brakesmith.mkv.part`; cancellation cleans it and invalid output is quarantined.
+- Partial output uses `.mkv.part`; cancellation cleans it and invalid output is quarantined.
 - Existing destination files are validated and never silently overwritten.
 - Source size, modification time, device, and inode are rechecked before and after encoding.
 - Output appears under its final name only after independent ffprobe validation.
 - Missing audio, path collisions, insufficient space, edited plans, and changed sources fail safely.
 - Batch execution requires review and confirmation unless `--yes` is used.
 - `--non-interactive` controls prompts separately from `--yes` confirmation bypass.
-
-After inspecting results, remove originals yourself. BrakeSmith deliberately has no destructive replace mode.
+- Replace mode publishes and validates the new file before deleting its source. A deletion failure keeps both files and reports failure.
 
 ## Requirements
 
@@ -130,6 +131,16 @@ Review and convert:
 brakesmith run
 ```
 
+After scanning, one global picker lists full language names and audio/subtitle counts. Use arrow keys and Space, then press Enter. English and French start selected; detected extras start unchecked.
+
+Tdarr-style in-place library conversion:
+
+```sh
+brakesmith run /smb --replace-source
+```
+
+Each successful file becomes MKV/HEVC, unselected streams and image/data attachments are omitted, codec text in its name is normalized, then its old source is deleted before the next file starts.
+
 Scan another directory:
 
 ```sh
@@ -142,7 +153,7 @@ Keep French, English, and detected original audio; keep French and English subti
 brakesmith run "/path/to/videos" --audio fra,eng --subtitles fra,eng --keep-original
 ```
 
-Unlabelled tracks are reviewed individually by default. For unattended batches, choose an explicit policy:
+Unlabelled tracks appear as one `Undefined` batch choice. If undefined is the only available language, it starts selected. For unattended batches, choose an explicit policy:
 
 ```sh
 brakesmith run "/path/to/videos" --unknown-audio keep --unknown-subtitles drop --yes
@@ -214,7 +225,7 @@ Create a plan without encoding:
 brakesmith plan "/Volumes/Media/Movies" \
   --output movie-batch.json \
   --output-directory "$HOME/BrakeSmith Output" \
-  --audio fra,eng \
+  --audio eng,fra \
   --unknown-audio language:eng \
   --unknown-subtitles drop \
   --no-keep-original \
@@ -231,6 +242,8 @@ brakesmith execute movie-batch.json --retry-failed --max-failures 0
 
 Plans include a digest and exact source identity. Editing a plan, changing a source, or using mismatched state is refused. State is saved beside the plan after every file.
 
+Add `--replace-source` while creating the plan to seal immediate per-file replacement into it.
+
 Exit codes: `0` success, `1` batch failure, `2` configuration/preflight failure, `130` cancellation.
 
 ## Profiles
@@ -239,8 +252,8 @@ Example `~/.config/brakesmith/config.toml`:
 
 ```toml
 [profiles.archive]
-audio = "fra,eng"
-subtitles = "fra,eng"
+audio = "eng,fra"
+subtitles = "eng,fra"
 unknown_audio = "language:eng"
 unknown_subtitles = "drop"
 quality = 18
@@ -282,15 +295,17 @@ BrakeSmith treats mounted SMB storage like local storage. By default, temporary 
 brakesmith run "/Volumes/Media/Movies" --output-directory "$HOME/BrakeSmith Output"
 ```
 
-Do not disconnect or unmount a share during encoding. If connectivity fails, the original remains untouched and the incomplete `.part` file is removed when possible.
+Do not disconnect or unmount a share during encoding. If connectivity fails, current source remains and incomplete `.part` cleanup is attempted. Sources from earlier completed replace-mode items are already deleted.
 
 ## Language metadata
 
 BrakeSmith uses stream/container language tags reported by ffprobe. ISO-639 codes such as `eng`, `fra`, `jpn`, and common `en`/`fr` aliases work. Media with wrong or absent tags cannot be identified reliably by software.
 
-When `--keep-original` is active and container metadata does not identify the original language, interactive runs ask once per affected file. Non-interactive runs fail safely until you pass `--original-language CODE` or `--no-keep-original`.
+`--keep-original` is opt-in. When active and container metadata does not identify the original language, interactive runs ask once per affected file. Normal runs avoid this by using the batch language picker.
 
-Tracks tagged `und` are never silently guessed. Interactive runs ask whether to keep each one. Automated runs must set `--unknown-audio keep|drop|language:CODE` and `--unknown-subtitles keep|drop|language:CODE`; unresolved `ask` policies fail safely with `--non-interactive`.
+Tracks tagged `und` are never language-guessed. Interactive runs expose one Undefined choice for the whole batch. Automated runs must set `--unknown-audio keep|drop|language:CODE` and `--unknown-subtitles keep|drop|language:CODE`; unresolved `ask` policies fail safely with `--non-interactive`.
+
+If a file contains none of the chosen languages, BrakeSmith keeps its eligible default-disposition tracks. If no audio is marked default, its first eligible audio track is retained. Subtitles without a default flag remain omitted.
 
 Commentary and descriptive tracks are excluded by title by default. Use `--keep-commentary`, `--forced-subtitles-only`, `--exclude-titles`, or per-file plan overrides when needed.
 
@@ -298,7 +313,9 @@ Inspect and fix incorrect tags with a tool such as MKVToolNix before a large bat
 
 ## Output
 
-`movie.mp4` becomes `movie.brakesmith.mkv`. Existing outputs are skipped. Use `--output-directory` to mirror the input tree elsewhere.
+Default mode: `movie.mp4` becomes `movie.brakesmith.mkv`, source retained.
+
+Replace mode: `Movie.1080p.x264.mp4` becomes `Movie.1080p.x265.mkv`; `Movie.AVC.avi` becomes `Movie.HEVC.mkv`. With no codec token, `.x265` is appended. Validated existing outputs resume source deletion safely.
 
 Existing outputs are skipped only after successful validation. Invalid files require an explicit `--invalid-existing quarantine` policy. Stale partial files default to failure and require an explicit policy.
 

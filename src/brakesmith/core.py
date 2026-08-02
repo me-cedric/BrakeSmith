@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -152,6 +153,7 @@ def ensure_source_unchanged(expected: SourceSnapshot) -> None:
 
 def validate_destinations(destinations: list[tuple[Path, Path]]) -> None:
     seen: dict[str, Path] = {}
+    sources = {str(source.resolve()).casefold(): source for source, _ in destinations}
     for source, destination in destinations:
         key = str(destination.resolve()).casefold()
         previous = seen.get(key)
@@ -161,6 +163,11 @@ def validate_destinations(destinations: list[tuple[Path, Path]]) -> None:
             )
         if source.resolve() == destination.resolve():
             raise BrakeSmithError(f"Output would replace source: {source}")
+        conflicting_source = sources.get(key)
+        if conflicting_source and conflicting_source != source:
+            raise BrakeSmithError(
+                f"Output for {source} would overwrite another source: {conflicting_source}"
+            )
         seen[key] = source
 
 
@@ -206,6 +213,10 @@ def validate_output(
     if len(media.subtitles) != expected_subtitles:
         raise BrakeSmithError(
             f"Output has {len(media.subtitles)} subtitle tracks, expected {expected_subtitles}: {path}"
+        )
+    if media.attachments:
+        raise BrakeSmithError(
+            f"Output still has {media.attachments} image/data/attachment stream(s): {path}"
         )
     if expected_chapters is not None and media.chapters != expected_chapters:
         raise BrakeSmithError(
@@ -330,15 +341,19 @@ def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFil
             command, capture_output=True, text=True, check=True, timeout=timeout
         )
         data = json.loads(result.stdout)
-    except (
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-        json.JSONDecodeError,
-        OSError,
-    ) as error:
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or str(error)).strip()
+        raise BrakeSmithError(f"Cannot inspect {path}: {detail}") from error
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as error:
         raise BrakeSmithError(f"Cannot inspect {path}: {error}") from error
     video = next(
-        (stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"), {}
+        (
+            stream
+            for stream in data.get("streams", [])
+            if stream.get("codec_type") == "video"
+            and not stream.get("disposition", {}).get("attached_pic")
+        ),
+        {},
     )
     tracks: dict[str, list[Track]] = {"audio": [], "subtitle": []}
     counters = {"audio": 0, "subtitle": 0}
@@ -402,7 +417,9 @@ def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFil
         hdr=transfer in {"smpte2084", "arib-std-b67"},
         dolby_vision=dolby_vision,
         attachments=sum(
-            stream.get("codec_type") == "attachment" for stream in data.get("streams", [])
+            stream.get("codec_type") in {"attachment", "data"}
+            or bool(stream.get("disposition", {}).get("attached_pic"))
+            for stream in data.get("streams", [])
         ),
         chapters=sum(
             float(chapter.get("end_time", 0)) - float(chapter.get("start_time", 0)) >= 1.0
@@ -503,19 +520,26 @@ def select_tracks(
     keep_commentary: bool = True,
     forced_only: bool = False,
     exclude_titles: Iterable[str] = (),
+    fallback_default: bool = False,
 ) -> list[int]:
     wanted = set(normalize_languages(languages))
     if original:
         wanted.add(normalize_languages([original])[0])
     excluded = [value.casefold() for value in exclude_titles if value]
-    return [
-        track.type_index
+    eligible = [
+        track
         for track in tracks
-        if track.language in wanted
-        and (keep_commentary or not track.commentary)
+        if (keep_commentary or not track.commentary)
         and (not forced_only or track.forced)
         and not any(value in track.title.casefold() for value in excluded)
     ]
+    selected = [track.type_index for track in eligible if track.language in wanted]
+    if selected or not fallback_default:
+        return selected
+    defaults = [track.type_index for track in eligible if track.default]
+    if defaults:
+        return defaults
+    return [eligible[0].type_index] if eligible and eligible[0].kind == "audio" else []
 
 
 def fidelity_warnings(media: MediaFile) -> list[str]:
@@ -525,7 +549,9 @@ def fidelity_warnings(media: MediaFile) -> list[str]:
     elif media.hdr:
         warnings.append("HDR detected; validate color and mastering metadata after encoding")
     if media.attachments:
-        warnings.append(f"{media.attachments} attachment(s) detected; HandBrake may not copy fonts")
+        warnings.append(
+            f"{media.attachments} image/data/attachment stream(s) detected; output removes them"
+        )
     if media.sidecars:
         warnings.append(
             f"{len(media.sidecars)} external subtitle sidecar(s) are not embedded automatically"
@@ -546,6 +572,35 @@ def output_path(
         return source.with_name(f"{source.stem}.brakesmith.mkv")
     relative = source.relative_to(scan_root) if scan_root else Path(source.name)
     return (output_root / relative).with_suffix(".brakesmith.mkv")
+
+
+def replacement_output_path(
+    source: Path, output_root: Path | None = None, scan_root: Path | None = None
+) -> Path:
+    stem = source.stem
+    replacements = (
+        (r"(?i)(?<![a-z0-9])x264(?![a-z0-9])", "x265"),
+        (r"(?i)(?<![a-z0-9])h\.264(?![a-z0-9])", "H.265"),
+        (r"(?i)(?<![a-z0-9])h264(?![a-z0-9])", "H265"),
+        (r"(?i)(?<![a-z0-9])avc(?![a-z0-9])", "HEVC"),
+    )
+    renamed_codec = False
+    for pattern, replacement in replacements:
+        stem, count = re.subn(pattern, replacement, stem)
+        renamed_codec = renamed_codec or bool(count)
+    if not renamed_codec and not re.search(
+        r"(?i)(?<![a-z0-9])(?:x265|h\.?265|hevc)(?![a-z0-9])", stem
+    ):
+        stem = f"{stem}.x265"
+
+    if output_root is None:
+        destination = source.with_name(f"{stem}.mkv")
+    else:
+        relative = source.relative_to(scan_root) if scan_root else Path(source.name)
+        destination = output_root / relative.parent / f"{stem}.mkv"
+    if destination.resolve() == source.resolve():
+        destination = destination.with_name(f"{destination.stem}.reencoded.mkv")
+    return destination
 
 
 def handbrake_command(

@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,9 @@ from brakesmith.core import (
     handbrake_command,
     normalize_languages,
     output_path,
+    probe,
     quarantine_file,
+    replacement_output_path,
     select_tracks,
     snapshot_source,
     validate_destinations,
@@ -61,9 +64,55 @@ def test_discover_rejects_file(tmp_path: Path):
         discover(path)
 
 
+def test_probe_ignores_cover_art_and_reports_ffprobe_reason(tmp_path: Path, monkeypatch):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"video")
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "mjpeg",
+                "disposition": {"attached_pic": 1},
+            },
+            {"index": 1, "codec_type": "video", "codec_name": "h264"},
+        ],
+        "format": {"duration": "10"},
+    }
+    monkeypatch.setattr(
+        "brakesmith.core.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, json.dumps(payload), ""),
+    )
+    media = probe(source)
+    assert media.codec == "h264"
+    assert media.attachments == 1
+
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["ffprobe"], stderr="moov atom not found")
+
+    monkeypatch.setattr("brakesmith.core.subprocess.run", fail)
+    with pytest.raises(BrakeSmithError, match="moov atom not found"):
+        probe(source)
+
+
 def test_track_selection_adds_original():
     tracks = [Track(1, 1, "audio", "eng"), Track(2, 2, "audio", "jpn"), Track(3, 3, "audio", "fra")]
     assert select_tracks(tracks, ["eng"], "jpn") == [1, 2]
+
+
+def test_track_selection_falls_back_to_defaults_and_first_audio():
+    audio = [
+        Track(1, 1, "audio", "jpn"),
+        Track(2, 2, "audio", "deu", default=True),
+    ]
+    subtitles = [
+        Track(3, 1, "subtitle", "jpn"),
+        Track(4, 2, "subtitle", "deu", default=True),
+    ]
+    assert select_tracks(audio, ["eng"], fallback_default=True) == [2]
+    assert select_tracks(subtitles, ["eng"], fallback_default=True) == [2]
+    assert select_tracks(audio[:1], ["eng"], fallback_default=True) == [1]
+    assert select_tracks(subtitles[:1], ["eng"], fallback_default=True) == []
 
 
 def test_output_paths():
@@ -72,6 +121,11 @@ def test_output_paths():
     assert output_path(source, Path("/out"), Path("/media")) == Path(
         "/out/show/episode.brakesmith.mkv"
     )
+    assert replacement_output_path(Path("/media/Movie.1080p.x264.mp4")) == Path(
+        "/media/Movie.1080p.x265.mkv"
+    )
+    assert replacement_output_path(Path("/media/Movie AVC.avi")) == Path("/media/Movie HEVC.mkv")
+    assert replacement_output_path(source) == Path("/media/show/episode.x265.mkv")
 
 
 def test_command_uses_copy_audio_and_selected_tracks(tmp_path: Path):
@@ -132,6 +186,13 @@ def test_destination_collision_is_rejected(tmp_path: Path):
     with pytest.raises(BrakeSmithError, match="Output collision"):
         validate_destinations(
             [(tmp_path / "movie.mp4", destination), (tmp_path / "movie.avi", destination)]
+        )
+    with pytest.raises(BrakeSmithError, match="another source"):
+        validate_destinations(
+            [
+                (tmp_path / "movie.x264.mkv", tmp_path / "movie.x265.mkv"),
+                (tmp_path / "movie.x265.mkv", tmp_path / "other.mkv"),
+            ]
         )
 
 
