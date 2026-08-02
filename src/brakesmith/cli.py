@@ -1481,7 +1481,7 @@ def run_batch(
         if replace_source
         else "Originals will remain untouched"
     )
-    if not yes and not Confirm.ask(f"Convert {len(items)} file(s)? {action}", default=False):
+    if not yes and not Confirm.ask(f"Convert {len(items)} file(s)? {action}", default=True):
         console.print("Cancelled. No files changed.")
         return
 
