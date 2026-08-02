@@ -24,6 +24,7 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 - Selectable audio and subtitle languages using names or ISO codes.
 - Original-language detection from container metadata.
 - Interactive reconciliation when original-language metadata is missing.
+- Per-track reconciliation for unlabelled audio and subtitles.
 - Explicit non-interactive fallback with `--original-language`.
 - H.265/x265 10-bit constant-quality encoding; conservative quality 18 and `slow` preset.
 - Audio passthrough when MKV supports the source codec, with AAC fallback.
@@ -33,6 +34,8 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 - Existing output is skipped, making interrupted batches safe to resume.
 - Same-directory temporary output works on mounted SMB shares without cross-filesystem moves.
 - JSON scan output for automation.
+- Custom extensions for unusual HandBrake-compatible containers.
+- Standalone executable artifacts built for macOS, Windows, and Linux.
 
 ## Safety model
 
@@ -92,6 +95,8 @@ With pipx:
 pipx install git+https://github.com/me-cedric/BrakeSmith.git
 ```
 
+Standalone executables are available as CI artifacts for macOS, Windows, and Linux. They bundle BrakeSmith and Python; HandBrakeCLI and ffprobe remain external requirements.
+
 From source:
 
 ```sh
@@ -126,6 +131,12 @@ Keep French, English, and detected original audio; keep French and English subti
 brakesmith run "/path/to/videos" --audio fra,eng --subtitles fra,eng --keep-original
 ```
 
+Unlabelled tracks are reviewed individually by default. For unattended batches, choose an explicit policy:
+
+```sh
+brakesmith run "/path/to/videos" --unknown-audio keep --unknown-subtitles drop --yes
+```
+
 For unattended processing where missing metadata should be treated as Japanese original audio:
 
 ```sh
@@ -148,6 +159,13 @@ Depth examples:
 brakesmith scan . --depth 0   # current directory only
 brakesmith scan . --depth 1   # current directory and direct children
 brakesmith scan . --depth -1  # unlimited recursion; default
+```
+
+Add an uncommon container extension without changing source code:
+
+```sh
+brakesmith scan . --extensions divx,video
+brakesmith run . --extensions divx,video
 ```
 
 Quality examples:
@@ -188,6 +206,8 @@ BrakeSmith uses stream/container language tags reported by ffprobe. ISO-639 code
 
 When `--keep-original` is active and container metadata does not identify the original language, interactive runs ask once per affected file. Non-interactive runs fail safely until you pass `--original-language CODE` or `--no-keep-original`.
 
+Tracks tagged `und` are never silently guessed. Interactive runs ask whether to keep each one. Automated runs must set `--unknown-audio keep|drop` and `--unknown-subtitles keep|drop`; unresolved `ask` policies fail safely with `--yes`.
+
 Inspect and fix incorrect tags with a tool such as MKVToolNix before a large batch.
 
 ## Output
@@ -207,7 +227,7 @@ uv run ruff check .
 uv build
 ```
 
-CI tests Python 3.9 and 3.13 on macOS, Windows, and Linux, then builds wheel and source distributions.
+CI tests Python 3.9 and 3.13 on macOS, Windows, and Linux, builds wheel/source and standalone distributions, then performs a real HandBrake encode on Linux. A real multilingual encode is also checked on macOS before release.
 
 ## License
 

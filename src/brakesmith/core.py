@@ -12,7 +12,9 @@ VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",
     ".flv",
+    ".f4v",
     ".m2ts",
+    ".m2v",
     ".m4v",
     ".mkv",
     ".mov",
@@ -21,6 +23,9 @@ VIDEO_EXTENSIONS = {
     ".mpg",
     ".mts",
     ".ogm",
+    ".ogv",
+    ".rm",
+    ".rmvb",
     ".ts",
     ".vob",
     ".webm",
@@ -96,10 +101,16 @@ def find_executable(name: str, explicit: Path | None = None) -> str | None:
     return None
 
 
-def discover(root: Path, max_depth: int | None = None) -> list[Path]:
+def discover(
+    root: Path, max_depth: int | None = None, extra_extensions: Iterable[str] = ()
+) -> list[Path]:
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise BrakeSmithError(f"Not a directory: {root}")
+    extensions = VIDEO_EXTENSIONS | {
+        value.lower() if value.startswith(".") else f".{value.lower()}"
+        for value in extra_extensions
+    }
     found = []
     for current, dirs, files in os.walk(root):
         relative = Path(current).relative_to(root)
@@ -108,7 +119,7 @@ def discover(root: Path, max_depth: int | None = None) -> list[Path]:
             dirs[:] = []
         for filename in files:
             path = Path(current) / filename
-            if path.suffix.lower() in VIDEO_EXTENSIONS and not filename.endswith(".brakesmith.mkv"):
+            if path.suffix.lower() in extensions and not filename.endswith(".brakesmith.mkv"):
                 found.append(path)
     return sorted(found, key=lambda path: str(path).lower())
 
@@ -183,9 +194,13 @@ def handbrake_command(
     original: str | None,
     quality: float,
     preset: str,
+    extra_audio: Iterable[int] = (),
+    extra_subtitles: Iterable[int] = (),
 ) -> list[str]:
-    audio = select_tracks(media.audio, audio_languages, original)
-    subtitles = select_tracks(media.subtitles, subtitle_languages)
+    audio = sorted(set(select_tracks(media.audio, audio_languages, original)) | set(extra_audio))
+    subtitles = sorted(
+        set(select_tracks(media.subtitles, subtitle_languages)) | set(extra_subtitles)
+    )
     command = [
         executable,
         "-i",

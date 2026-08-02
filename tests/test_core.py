@@ -29,6 +29,12 @@ def test_discover_respects_depth_and_ignores_outputs(tmp_path: Path):
     assert len(discover(tmp_path)) == 2
 
 
+def test_discover_accepts_custom_extension(tmp_path: Path):
+    unusual = tmp_path / "archive.video"
+    unusual.touch()
+    assert discover(tmp_path, extra_extensions=["video"]) == [unusual]
+
+
 def test_discover_rejects_file(tmp_path: Path):
     path = tmp_path / "video.mkv"
     path.touch()
@@ -66,3 +72,28 @@ def test_command_uses_copy_audio_and_selected_tracks(tmp_path: Path):
         "1",
     ]
     assert "x265_10bit" in command
+
+
+def test_command_can_keep_reconciled_unknown_tracks(tmp_path: Path):
+    media = MediaFile(
+        tmp_path / "a.mp4",
+        "h264",
+        10,
+        1,
+        [Track(1, 1, "audio", "und")],
+        [Track(2, 1, "subtitle", "und")],
+    )
+    command = handbrake_command(
+        "HandBrakeCLI",
+        media,
+        tmp_path / "out.part",
+        ["eng"],
+        ["fra"],
+        None,
+        18,
+        "slow",
+        extra_audio=[1],
+        extra_subtitles=[1],
+    )
+    assert command[command.index("--audio") + 1] == "1"
+    assert command[command.index("--subtitle") + 1] == "1"

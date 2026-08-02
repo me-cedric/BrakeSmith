@@ -46,12 +46,14 @@ def main(
     """Safety-first batch H.265 transcoding."""
 
 
-def inspect(root: Path, depth: int, ffprobe_path: Optional[Path]) -> list[MediaFile]:
+def inspect(
+    root: Path, depth: int, ffprobe_path: Optional[Path], extensions: str = ""
+) -> list[MediaFile]:
     ffprobe = find_executable("ffprobe", ffprobe_path)
     if not ffprobe:
         raise BrakeSmithError("ffprobe not found. Install FFmpeg or pass --ffprobe.")
     limit = None if depth < 0 else depth
-    paths = discover(root, limit)
+    paths = discover(root, limit, extensions.split(",") if extensions else ())
     media = []
     with console.status(f"Inspecting {len(paths)} video files…"):
         for path in paths:
@@ -95,11 +97,12 @@ def scan(
         -1, help="Subdirectory depth; -1 means recursive, 0 means this directory only."
     ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+    extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
 ) -> None:
     """List every supported video and whether it should be converted."""
     try:
-        items = inspect(directory, depth, ffprobe)
+        items = inspect(directory, depth, ffprobe, extensions)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
@@ -166,12 +169,43 @@ def reconcile_original(
     return result
 
 
+def reconcile_unknown_tracks(
+    items: list[MediaFile], kind: str, policy: str, yes: bool
+) -> dict[Path, set[int]]:
+    if policy not in {"ask", "keep", "drop"}:
+        raise BrakeSmithError(f"--unknown-{kind} must be ask, keep, or drop")
+    result: dict[Path, set[int]] = {item.path: set() for item in items}
+    for item in items:
+        tracks = item.audio if kind == "audio" else item.subtitles
+        for track in (candidate for candidate in tracks if candidate.language == "und"):
+            if policy == "keep":
+                result[item.path].add(track.type_index)
+            elif policy == "ask":
+                if yes:
+                    raise BrakeSmithError(
+                        f"Unlabelled {kind} track {track.type_index} in {item.path}; "
+                        f"use --unknown-{kind} keep or drop."
+                    )
+                label = f" ({track.title})" if track.title else ""
+                if Confirm.ask(
+                    f"Keep unlabelled {kind} track {track.type_index}{label} in "
+                    f"[bold]{item.path.name}[/]?",
+                    default=False,
+                ):
+                    result[item.path].add(track.type_index)
+    return result
+
+
 @app.command(name="run")
 def run_batch(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
     depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
     audio: str = typer.Option("fra,eng", help="Audio languages to keep (ISO codes or names)."),
     subtitles: str = typer.Option("fra,eng", help="Subtitle languages to keep."),
+    unknown_audio: str = typer.Option("ask", help="Unlabelled audio tracks: ask, keep, or drop."),
+    unknown_subtitles: str = typer.Option(
+        "ask", help="Unlabelled subtitle tracks: ask, keep, or drop."
+    ),
     keep_original: bool = typer.Option(
         True,
         "--keep-original/--no-keep-original",
@@ -188,6 +222,7 @@ def run_batch(
         None, help="Mirror results under another directory."
     ),
     include_hevc: bool = typer.Option(False, help="Reprocess files already encoded as HEVC."),
+    extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
     yes: bool = typer.Option(
         False, "--yes", "-y", help="Skip final confirmation; unresolved originals still fail."
     ),
@@ -200,19 +235,30 @@ def run_batch(
         console.print("[red]Error:[/] HandBrakeCLI not found. Run `brakesmith doctor`.")
         raise typer.Exit(2)
     try:
-        items = [m for m in inspect(directory, depth, ffprobe) if m.should_convert or include_hevc]
+        items = [
+            m
+            for m in inspect(directory, depth, ffprobe, extensions)
+            if m.should_convert or include_hevc
+        ]
         render(items, directory)
         if not items:
             return
         originals = reconcile_original(items, keep_original, original_language, yes)
+        extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, yes)
+        extra_subtitles = reconcile_unknown_tracks(items, "subtitles", unknown_subtitles, yes)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
     audio_languages = normalize_languages(audio.split(","))
     subtitle_languages = normalize_languages(subtitles.split(","))
     for item in items:
-        kept_audio = select_tracks(item.audio, audio_languages, originals[item.path])
-        kept_subs = select_tracks(item.subtitles, subtitle_languages)
+        kept_audio = sorted(
+            set(select_tracks(item.audio, audio_languages, originals[item.path]))
+            | extra_audio[item.path]
+        )
+        kept_subs = sorted(
+            set(select_tracks(item.subtitles, subtitle_languages)) | extra_subtitles[item.path]
+        )
         console.print(
             f"{item.path.name}: audio {kept_audio or 'none'}, subtitles {kept_subs or 'none'}, original {originals[item.path] or 'unknown'}"
         )
@@ -224,6 +270,8 @@ def run_batch(
 
     progress_pattern = re.compile(r"(\d+(?:\.\d+)?)\s*%")
     failures = 0
+    completed = 0
+    skipped = 0
     with Progress(
         TextColumn("{task.description}"),
         BarColumn(),
@@ -238,6 +286,7 @@ def run_batch(
             partial = destination.with_name(destination.name + ".part")
             if destination.exists():
                 console.print(f"[yellow]Skip:[/] {destination} exists")
+                skipped += 1
                 progress.advance(total_task)
                 continue
             if partial.exists():
@@ -253,6 +302,8 @@ def run_batch(
                 originals[item.path],
                 quality,
                 preset,
+                extra_audio[item.path],
+                extra_subtitles[item.path],
             )
             process: Optional[subprocess.Popen[str]] = None
             try:
@@ -271,6 +322,7 @@ def run_batch(
                 if process.wait() != 0:
                     raise BrakeSmithError(f"HandBrake failed for {item.path.name}")
                 partial.replace(destination)
+                completed += 1
                 progress.update(file_task, completed=100)
             except KeyboardInterrupt:
                 if process:
@@ -292,7 +344,8 @@ def run_batch(
                 progress.remove_task(file_task)
                 progress.advance(total_task)
     console.print(
-        f"[green]Done:[/] {len(items) - failures} completed, {failures} failed. Originals untouched."
+        f"[green]Done:[/] {completed} completed, {skipped} skipped, {failures} failed. "
+        "Originals untouched."
     )
     if failures:
         raise typer.Exit(1)
