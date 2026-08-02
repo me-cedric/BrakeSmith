@@ -94,7 +94,7 @@ Checked items are implemented, reviewed, and committed. Each stage receives a pa
 - [x] Update README and migration notes
 - [x] Tag consolidated `v0.4.0` release locally
 - [x] Push consolidated `v0.4.0` source to GitHub
-- [ ] Push annotated patch/milestone tags and create the GitHub release (blocked here by DNS and expired CLI credentials)
+- [x] Push annotated patch/milestone tags and create the GitHub release
 
 ## Later milestones
 
