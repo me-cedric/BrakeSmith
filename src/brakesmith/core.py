@@ -311,10 +311,6 @@ def validate_output(
         raise BrakeSmithError(
             f"Output has {len(media.subtitles)} subtitle tracks, expected {expected_subtitles}: {path}"
         )
-    if media.attachments:
-        raise BrakeSmithError(
-            f"Output still has {media.attachments} image/data/attachment stream(s): {path}"
-        )
     if expected_chapters is not None and media.chapters != expected_chapters:
         raise BrakeSmithError(
             f"Output has {media.chapters} chapters, expected {expected_chapters}: {path}"
@@ -647,7 +643,7 @@ def fidelity_warnings(media: MediaFile) -> list[str]:
         warnings.append("HDR detected; validate color and mastering metadata after encoding")
     if media.attachments:
         warnings.append(
-            f"{media.attachments} image/data/attachment stream(s) detected; output removes them"
+            f"{media.attachments} image/data/attachment stream(s) detected; HandBrake may preserve them"
         )
     if media.sidecars:
         warnings.append(

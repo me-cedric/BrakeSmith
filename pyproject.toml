@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "brakesmith"
-version = "0.5.0"
+version = "0.5.1"
 description = "Safety-first batch H.265 transcoding with HandBrakeCLI"
 readme = "README.md"
 requires-python = ">=3.9"

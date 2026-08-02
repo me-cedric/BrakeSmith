@@ -211,6 +211,23 @@ def test_validate_output_checks_tracks(tmp_path: Path, monkeypatch):
         validate_output(output, "ffprobe", 100, 2, 0)
 
 
+def test_validate_output_allows_handbrake_preserved_attachments(tmp_path: Path, monkeypatch):
+    output = tmp_path / "movie.part"
+    output.write_bytes(b"x" * 2048)
+    monkeypatch.setattr(
+        "brakesmith.core.probe",
+        lambda *args: MediaFile(
+            output,
+            "hevc",
+            100,
+            2048,
+            [Track(1, 1, "audio", "eng")],
+            attachments=4,
+        ),
+    )
+    assert validate_output(output, "ffprobe", 100, 1, 0).attachments == 4
+
+
 def test_quarantine_never_overwrites(tmp_path: Path):
     partial = tmp_path / "movie.part"
     partial.write_text("first")

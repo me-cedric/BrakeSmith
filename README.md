@@ -142,7 +142,7 @@ Tdarr-style in-place library conversion:
 brakesmith run /smb --replace-source
 ```
 
-Each successful file becomes MKV/HEVC, unselected streams and image/data attachments are omitted, and codec text in its name is normalized. Smaller output replaces its source before the next file starts; equal/larger output is discarded.
+Each successful file becomes MKV/HEVC, unselected audio/subtitle streams are omitted, and codec text in its name is normalized. HandBrake may preserve container attachments such as fonts or cover art. Smaller output replaces its source before the next file starts; equal/larger output is discarded.
 
 For unattended runs, prompts stay disabled and explicit settings apply:
 
