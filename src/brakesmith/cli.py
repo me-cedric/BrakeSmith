@@ -28,6 +28,7 @@ from .core import (
     atomic_write_json,
     discover,
     ensure_source_unchanged,
+    fidelity_warnings,
     find_executable,
     handbrake_command,
     normalize_languages,
@@ -186,6 +187,22 @@ def media_payload(item: MediaFile) -> dict[str, object]:
         "original_language": item.original_language,
         "audio": [vars(track) for track in item.audio],
         "subtitles": [vars(track) for track in item.subtitles],
+        "video": {
+            "width": item.width,
+            "height": item.height,
+            "pixel_format": item.pixel_format,
+            "frame_rate": item.frame_rate,
+            "field_order": item.field_order,
+            "color_transfer": item.color_transfer,
+            "color_primaries": item.color_primaries,
+            "color_space": item.color_space,
+            "hdr": item.hdr,
+            "dolby_vision": item.dolby_vision,
+        },
+        "attachments": item.attachments,
+        "chapters": item.chapters,
+        "sidecars": [str(path) for path in item.sidecars],
+        "warnings": fidelity_warnings(item),
     }
 
 
@@ -370,13 +387,19 @@ def reconcile_original(
 def reconcile_unknown_tracks(
     items: list[MediaFile], kind: str, policy: str, yes: bool
 ) -> dict[Path, set[int]]:
-    if policy not in {"ask", "keep", "drop"}:
-        raise BrakeSmithError(f"--unknown-{kind} must be ask, keep, or drop")
+    assigned_language: Optional[str] = None
+    if policy.startswith("language:"):
+        value = policy.partition(":")[2]
+        if not value:
+            raise BrakeSmithError(f"--unknown-{kind} language assignment needs a code")
+        assigned_language = normalize_languages([value])[0]
+    elif policy not in {"ask", "keep", "drop"}:
+        raise BrakeSmithError(f"--unknown-{kind} must be ask, keep, drop, or language:CODE")
     result: dict[Path, set[int]] = {item.path: set() for item in items}
     for item in items:
         tracks = item.audio if kind == "audio" else item.subtitles
         for track in (candidate for candidate in tracks if candidate.language == "und"):
-            if policy == "keep":
+            if policy == "keep" or assigned_language:
                 result[item.path].add(track.type_index)
             elif policy == "ask":
                 if yes:
@@ -403,11 +426,26 @@ def plan_batch(
     subtitles: str = typer.Option("fra,eng", help="Subtitle languages to keep."),
     unknown_audio: str = typer.Option("ask", help="Unlabelled audio: ask, keep, or drop."),
     unknown_subtitles: str = typer.Option("ask", help="Unlabelled subtitles: ask, keep, or drop."),
+    keep_commentary: bool = typer.Option(False, help="Keep commentary tracks."),
+    forced_subtitles_only: bool = typer.Option(False, help="Keep only forced requested subtitles."),
+    exclude_titles: str = typer.Option(
+        "commentary,description", help="Track-title fragments to exclude."
+    ),
     keep_original: bool = typer.Option(True, "--keep-original/--no-keep-original"),
     original_language: Optional[str] = typer.Option(None),
     quality: float = typer.Option(18.0, min=0, max=51),
     preset: str = typer.Option("slow"),
+    bit_depth: int = typer.Option(10, min=8, max=12),
+    tune: Optional[str] = typer.Option(None),
+    encoder_profile: Optional[str] = typer.Option(None),
+    encoder_level: Optional[str] = typer.Option(None),
+    crop: str = typer.Option("auto", help="Crop policy: auto or none."),
+    deinterlace: str = typer.Option("auto", help="auto, off, decomb, or yadif."),
+    lossless: bool = typer.Option(False, help="x265 lossless mode; output may be huge."),
     output_directory: Optional[Path] = typer.Option(None),
+    overrides: Optional[Path] = typer.Option(
+        None, exists=True, dir_okay=False, help="Per-source audio_tracks/subtitle_tracks JSON."
+    ),
     allow_no_audio: bool = typer.Option(False),
     extensions: str = typer.Option(""),
     workers: int = typer.Option(2, min=1, max=32),
@@ -448,16 +486,62 @@ def plan_batch(
         extra_subtitles = reconcile_unknown_tracks(items, "subtitles", unknown_subtitles, yes)
         audio_languages = normalize_languages(audio.split(","))
         subtitle_languages = normalize_languages(subtitles.split(","))
+        excluded_titles = [value.strip() for value in exclude_titles.split(",") if value.strip()]
+        override_map: dict[str, object] = {}
+        if overrides:
+            try:
+                loaded_overrides = json.loads(overrides.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise BrakeSmithError(f"Cannot read overrides {overrides}: {error}") from error
+            if not isinstance(loaded_overrides, dict):
+                raise BrakeSmithError("Overrides must be a JSON object keyed by source path")
+            override_map = loaded_overrides
         plan_items: list[dict[str, object]] = []
         destinations: list[tuple[Path, Path]] = []
         for item in items:
             selected_audio = sorted(
-                set(select_tracks(item.audio, audio_languages, originals[item.path]))
+                set(
+                    select_tracks(
+                        item.audio,
+                        audio_languages,
+                        originals[item.path],
+                        keep_commentary=keep_commentary,
+                        exclude_titles=excluded_titles,
+                    )
+                )
                 | extra_audio[item.path]
             )
             selected_subtitles = sorted(
-                set(select_tracks(item.subtitles, subtitle_languages)) | extra_subtitles[item.path]
+                set(
+                    select_tracks(
+                        item.subtitles,
+                        subtitle_languages,
+                        keep_commentary=keep_commentary,
+                        forced_only=forced_subtitles_only,
+                        exclude_titles=excluded_titles,
+                    )
+                )
+                | extra_subtitles[item.path]
             )
+            override = override_map.get(str(item.path)) or override_map.get(
+                str(item.path.relative_to(directory))
+            )
+            if override:
+                if not isinstance(override, dict):
+                    raise BrakeSmithError(f"Invalid override for {item.path}")
+                selected_audio = sorted(
+                    int(value) for value in override.get("audio_tracks", selected_audio)
+                )
+                selected_subtitles = sorted(
+                    int(value) for value in override.get("subtitle_tracks", selected_subtitles)
+                )
+                valid_audio = {track.type_index for track in item.audio}
+                valid_subtitles = {track.type_index for track in item.subtitles}
+                if (
+                    not set(selected_audio) <= valid_audio
+                    or not set(selected_subtitles) <= valid_subtitles
+                ):
+                    raise BrakeSmithError(f"Override references missing track for {item.path}")
             if item.audio and not selected_audio and not allow_no_audio:
                 raise BrakeSmithError(f"No audio selected for {item.path}; adjust policy")
             destination = output_path(item.path, output_directory, directory)
@@ -477,8 +561,10 @@ def plan_batch(
                         "inode": snapshot.inode,
                     },
                     "duration": item.duration,
+                    "chapters": item.chapters,
                     "audio_tracks": selected_audio,
                     "subtitle_tracks": selected_subtitles,
+                    "warnings": fidelity_warnings(item),
                     "command": handbrake_command(
                         executable,
                         item,
@@ -490,10 +576,22 @@ def plan_batch(
                         preset,
                         extra_audio[item.path],
                         extra_subtitles[item.path],
+                        bit_depth,
+                        tune,
+                        encoder_profile,
+                        encoder_level,
+                        crop,
+                        deinterlace,
+                        lossless,
+                        selected_audio,
+                        selected_subtitles,
                     ),
                 }
             )
         validate_destinations(destinations)
+        for item in plan_items:
+            for warning in item["warnings"]:
+                console.print(f"[yellow]Warning:[/] {Path(str(item['source'])).name}: {warning}")
         payload = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "root": str(directory),
@@ -501,6 +599,13 @@ def plan_batch(
             "settings": {
                 "quality": quality,
                 "preset": preset,
+                "bit_depth": bit_depth,
+                "tune": tune,
+                "profile": encoder_profile,
+                "level": encoder_level,
+                "crop": crop,
+                "deinterlace": deinterlace,
+                "lossless": lossless,
                 "audio_languages": audio_languages,
                 "subtitle_languages": subtitle_languages,
             },
@@ -613,6 +718,7 @@ def execute_plan(
                                 duration,
                                 expected_audio,
                                 expected_subtitles,
+                                int(item.get("chapters", 0)),
                             )
                             statuses[str(source)] = {
                                 "status": "completed",
@@ -657,6 +763,7 @@ def execute_plan(
                                 duration,
                                 expected_audio,
                                 expected_subtitles,
+                                int(item.get("chapters", 0)),
                             )
                             partial.replace(destination)
                             statuses[str(source)] = {
@@ -754,6 +861,11 @@ def run_batch(
     unknown_subtitles: str = typer.Option(
         "ask", help="Unlabelled subtitle tracks: ask, keep, or drop."
     ),
+    keep_commentary: bool = typer.Option(False, help="Keep commentary tracks."),
+    forced_subtitles_only: bool = typer.Option(False, help="Keep only forced requested subtitles."),
+    exclude_titles: str = typer.Option(
+        "commentary,description", help="Track-title fragments to exclude."
+    ),
     keep_original: bool = typer.Option(
         True,
         "--keep-original/--no-keep-original",
@@ -766,6 +878,13 @@ def run_batch(
         18.0, min=0, max=51, help="x265 constant quality; lower is larger/better."
     ),
     preset: str = typer.Option("slow", help="x265 encoder preset."),
+    bit_depth: int = typer.Option(10, min=8, max=12, help="x265 output bit depth."),
+    tune: Optional[str] = typer.Option(None, help="x265 tune."),
+    encoder_profile: Optional[str] = typer.Option(None, help="x265 profile."),
+    encoder_level: Optional[str] = typer.Option(None, help="x265 level."),
+    crop: str = typer.Option("auto", help="Crop policy: auto or none."),
+    deinterlace: str = typer.Option("auto", help="auto, off, decomb, or yadif."),
+    lossless: bool = typer.Option(False, help="x265 lossless mode; output may be huge."),
     output_directory: Optional[Path] = typer.Option(
         None, help="Mirror results under another directory."
     ),
@@ -830,15 +949,33 @@ def run_batch(
         raise typer.Exit(2)
     audio_languages = normalize_languages(audio.split(","))
     subtitle_languages = normalize_languages(subtitles.split(","))
+    excluded_titles = [value.strip() for value in exclude_titles.split(",") if value.strip()]
     selected_audio: dict[Path, list[int]] = {}
     selected_subtitles: dict[Path, list[int]] = {}
     for item in items:
         kept_audio = sorted(
-            set(select_tracks(item.audio, audio_languages, originals[item.path]))
+            set(
+                select_tracks(
+                    item.audio,
+                    audio_languages,
+                    originals[item.path],
+                    keep_commentary=keep_commentary,
+                    exclude_titles=excluded_titles,
+                )
+            )
             | extra_audio[item.path]
         )
         kept_subs = sorted(
-            set(select_tracks(item.subtitles, subtitle_languages)) | extra_subtitles[item.path]
+            set(
+                select_tracks(
+                    item.subtitles,
+                    subtitle_languages,
+                    keep_commentary=keep_commentary,
+                    forced_only=forced_subtitles_only,
+                    exclude_titles=excluded_titles,
+                )
+            )
+            | extra_subtitles[item.path]
         )
         if item.audio and not kept_audio and not allow_no_audio:
             console.print(
@@ -851,6 +988,8 @@ def run_batch(
         console.print(
             f"{item.path.name}: audio {kept_audio or 'none'}, subtitles {kept_subs or 'none'}, original {originals[item.path] or 'unknown'}"
         )
+        for warning in fidelity_warnings(item):
+            console.print(f"[yellow]Warning:[/] {item.path.name}: {warning}")
     destinations = {
         item.path: output_path(item.path, output_directory, directory) for item in items
     }
@@ -906,6 +1045,7 @@ def run_batch(
                             item.duration,
                             len(selected_audio[item.path]),
                             len(selected_subtitles[item.path]),
+                            item.chapters,
                         )
                         console.print(f"[yellow]Skip:[/] Valid output exists: {destination}")
                         skipped += 1
@@ -944,6 +1084,7 @@ def run_batch(
                             item.duration,
                             len(selected_audio[item.path]),
                             len(selected_subtitles[item.path]),
+                            item.chapters,
                         )
                         classification = "valid"
                     except BrakeSmithError:
@@ -982,6 +1123,15 @@ def run_batch(
                     preset,
                     extra_audio[item.path],
                     extra_subtitles[item.path],
+                    bit_depth,
+                    tune,
+                    encoder_profile,
+                    encoder_level,
+                    crop,
+                    deinterlace,
+                    lossless,
+                    selected_audio[item.path],
+                    selected_subtitles[item.path],
                 )
                 process: Optional[subprocess.Popen[str]] = None
                 diagnostics: list[str] = []
@@ -1008,6 +1158,7 @@ def run_batch(
                         item.duration,
                         len(selected_audio[item.path]),
                         len(selected_subtitles[item.path]),
+                        item.chapters,
                     )
                     partial.replace(destination)
                     completed += 1

@@ -58,17 +58,17 @@ Checked items are implemented, reviewed, and committed. Each stage receives a pa
 
 ## v0.3.5 — Fidelity and track policy
 
-- [ ] Inspect HDR, Dolby Vision, color metadata, interlace, frame rate, and resolution
-- [ ] Warn when source features may not survive current HandBrake settings
-- [ ] Inspect MKV attachments and external subtitle sidecars
-- [ ] Capture track title and default/forced/hearing-impaired/commentary flags
-- [ ] Filter tracks by language plus title/flags
-- [ ] Improve ISO-639 alias normalization
-- [ ] Reconcile unlabelled tracks by assigning a language or keep/drop
-- [ ] Support per-file track overrides in saved plans
-- [ ] Expose encoder bit depth, tune, profile, level, crop, and deinterlace policy
-- [ ] Add optional lossless mode with storage warning
-- [ ] Preserve and validate chapters and duration
+- [x] Inspect HDR, Dolby Vision, color metadata, interlace, frame rate, and resolution
+- [x] Warn when source features may not survive current HandBrake settings
+- [x] Inspect MKV attachments and external subtitle sidecars
+- [x] Capture track title and default/forced/hearing-impaired/commentary flags
+- [x] Filter tracks by language plus title/flags
+- [x] Improve ISO-639 alias normalization
+- [x] Reconcile unlabelled tracks by assigning a language or keep/drop
+- [x] Support per-file track overrides in saved plans
+- [x] Expose encoder bit depth, tune, profile, level, crop, and deinterlace policy
+- [x] Add optional lossless mode with storage warning
+- [x] Preserve and validate chapters and duration
 
 ## v0.3.6 — Large-library UX
 

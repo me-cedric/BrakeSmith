@@ -43,6 +43,30 @@ LANG_ALIASES = {
     "français": "fra",
     "und": "und",
     "unknown": "und",
+    "de": "deu",
+    "deu": "deu",
+    "ger": "deu",
+    "german": "deu",
+    "es": "spa",
+    "spa": "spa",
+    "spanish": "spa",
+    "it": "ita",
+    "ita": "ita",
+    "italian": "ita",
+    "ja": "jpn",
+    "jpn": "jpn",
+    "japanese": "jpn",
+    "pt": "por",
+    "por": "por",
+    "portuguese": "por",
+    "nl": "nld",
+    "nld": "nld",
+    "dut": "nld",
+    "dutch": "nld",
+    "zh": "zho",
+    "zho": "zho",
+    "chi": "zho",
+    "chinese": "zho",
 }
 
 
@@ -73,6 +97,13 @@ class Track:
     kind: str
     language: str
     title: str = ""
+    codec: str = "unknown"
+    channels: int = 0
+    default: bool = False
+    forced: bool = False
+    hearing_impaired: bool = False
+    visual_impaired: bool = False
+    commentary: bool = False
 
 
 @dataclass
@@ -84,6 +115,19 @@ class MediaFile:
     audio: list[Track] = field(default_factory=list)
     subtitles: list[Track] = field(default_factory=list)
     original_language: str | None = None
+    width: int = 0
+    height: int = 0
+    pixel_format: str = ""
+    color_transfer: str = ""
+    color_primaries: str = ""
+    color_space: str = ""
+    field_order: str = ""
+    frame_rate: str = ""
+    hdr: bool = False
+    dolby_vision: bool = False
+    attachments: int = 0
+    chapters: int = 0
+    sidecars: list[Path] = field(default_factory=list)
 
     @property
     def should_convert(self) -> bool:
@@ -143,6 +187,7 @@ def validate_output(
     source_duration: float,
     expected_audio: int,
     expected_subtitles: int,
+    expected_chapters: int | None = None,
 ) -> MediaFile:
     if not path.is_file() or path.stat().st_size < 1024:
         raise BrakeSmithError(f"Output is missing or too small: {path}")
@@ -161,6 +206,10 @@ def validate_output(
     if len(media.subtitles) != expected_subtitles:
         raise BrakeSmithError(
             f"Output has {len(media.subtitles)} subtitle tracks, expected {expected_subtitles}: {path}"
+        )
+    if expected_chapters is not None and media.chapters != expected_chapters:
+        raise BrakeSmithError(
+            f"Output has {media.chapters} chapters, expected {expected_chapters}: {path}"
         )
     return media
 
@@ -260,7 +309,17 @@ def discover(
 
 
 def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFile:
-    command = [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)]
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_format",
+        "-show_streams",
+        "-show_chapters",
+        "-of",
+        "json",
+        str(path),
+    ]
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, check=True, timeout=timeout
@@ -284,6 +343,7 @@ def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFil
             continue
         counters[kind] += 1
         tags = stream.get("tags", {})
+        disposition = stream.get("disposition", {})
         language = normalize_languages([tags.get("language", "und")])[0]
         tracks[kind].append(
             Track(
@@ -292,12 +352,32 @@ def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFil
                 kind=kind,
                 language=language,
                 title=tags.get("title", ""),
+                codec=stream.get("codec_name", "unknown"),
+                channels=int(stream.get("channels", 0) or 0),
+                default=bool(disposition.get("default")),
+                forced=bool(disposition.get("forced")),
+                hearing_impaired=bool(disposition.get("hearing_impaired")),
+                visual_impaired=bool(disposition.get("visual_impaired")),
+                commentary=bool(disposition.get("comment")),
             )
         )
     format_data = data.get("format", {})
     tags = {str(k).lower(): v for k, v in format_data.get("tags", {}).items()}
     original = tags.get("original_language") or tags.get("language")
     normalized_original = normalize_languages([original])[0] if original else None
+    transfer = video.get("color_transfer", "")
+    side_data = video.get("side_data_list", [])
+    dolby_vision = any(
+        "dovi" in str(entry.get("side_data_type", "")).lower()
+        or "dolby vision" in str(entry.get("side_data_type", "")).lower()
+        for entry in side_data
+    )
+    sidecar_extensions = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx"}
+    sidecars = sorted(
+        candidate
+        for candidate in path.parent.glob(f"{path.stem}.*")
+        if candidate != path and candidate.suffix.lower() in sidecar_extensions
+    )
     return MediaFile(
         path=path,
         codec=video.get("codec_name", "unknown"),
@@ -306,6 +386,21 @@ def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFil
         audio=tracks["audio"],
         subtitles=tracks["subtitle"],
         original_language=normalized_original,
+        width=int(video.get("width", 0) or 0),
+        height=int(video.get("height", 0) or 0),
+        pixel_format=video.get("pix_fmt", ""),
+        color_transfer=transfer,
+        color_primaries=video.get("color_primaries", ""),
+        color_space=video.get("color_space", ""),
+        field_order=video.get("field_order", ""),
+        frame_rate=video.get("avg_frame_rate", ""),
+        hdr=transfer in {"smpte2084", "arib-std-b67"},
+        dolby_vision=dolby_vision,
+        attachments=sum(
+            stream.get("codec_type") == "attachment" for stream in data.get("streams", [])
+        ),
+        chapters=len(data.get("chapters", [])),
+        sidecars=sidecars,
     )
 
 
@@ -321,7 +416,7 @@ class ProbeCache:
         self.entries: dict[str, dict[str, object]] = {}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            if payload.get("version") == 1 and isinstance(payload.get("entries"), dict):
+            if payload.get("version") == 2 and isinstance(payload.get("entries"), dict):
                 self.entries = payload["entries"]
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
@@ -347,6 +442,19 @@ class ProbeCache:
                 audio=[Track(**track) for track in entry.get("audio", [])],
                 subtitles=[Track(**track) for track in entry.get("subtitles", [])],
                 original_language=entry.get("original_language"),
+                width=int(entry.get("width", 0)),
+                height=int(entry.get("height", 0)),
+                pixel_format=str(entry.get("pixel_format", "")),
+                color_transfer=str(entry.get("color_transfer", "")),
+                color_primaries=str(entry.get("color_primaries", "")),
+                color_space=str(entry.get("color_space", "")),
+                field_order=str(entry.get("field_order", "")),
+                frame_rate=str(entry.get("frame_rate", "")),
+                hdr=bool(entry.get("hdr", False)),
+                dolby_vision=bool(entry.get("dolby_vision", False)),
+                attachments=int(entry.get("attachments", 0)),
+                chapters=int(entry.get("chapters", 0)),
+                sidecars=[Path(value) for value in entry.get("sidecars", [])],
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -361,19 +469,66 @@ class ProbeCache:
             "original_language": media.original_language,
             "audio": [vars(track) for track in media.audio],
             "subtitles": [vars(track) for track in media.subtitles],
+            "width": media.width,
+            "height": media.height,
+            "pixel_format": media.pixel_format,
+            "color_transfer": media.color_transfer,
+            "color_primaries": media.color_primaries,
+            "color_space": media.color_space,
+            "field_order": media.field_order,
+            "frame_rate": media.frame_rate,
+            "hdr": media.hdr,
+            "dolby_vision": media.dolby_vision,
+            "attachments": media.attachments,
+            "chapters": media.chapters,
+            "sidecars": [str(path) for path in media.sidecars],
         }
 
     def save(self) -> None:
-        atomic_write_json(self.path, {"version": 1, "entries": self.entries}, force=True)
+        atomic_write_json(self.path, {"version": 2, "entries": self.entries}, force=True)
 
 
 def select_tracks(
-    tracks: list[Track], languages: list[str], original: str | None = None
+    tracks: list[Track],
+    languages: list[str],
+    original: str | None = None,
+    keep_commentary: bool = True,
+    forced_only: bool = False,
+    exclude_titles: Iterable[str] = (),
 ) -> list[int]:
     wanted = set(normalize_languages(languages))
     if original:
         wanted.add(normalize_languages([original])[0])
-    return [track.type_index for track in tracks if track.language in wanted]
+    excluded = [value.casefold() for value in exclude_titles if value]
+    return [
+        track.type_index
+        for track in tracks
+        if track.language in wanted
+        and (keep_commentary or not track.commentary)
+        and (not forced_only or track.forced)
+        and not any(value in track.title.casefold() for value in excluded)
+    ]
+
+
+def fidelity_warnings(media: MediaFile) -> list[str]:
+    warnings = []
+    if media.dolby_vision:
+        warnings.append("Dolby Vision detected; current encode may not preserve dynamic metadata")
+    elif media.hdr:
+        warnings.append("HDR detected; validate color and mastering metadata after encoding")
+    if media.attachments:
+        warnings.append(f"{media.attachments} attachment(s) detected; HandBrake may not copy fonts")
+    if media.sidecars:
+        warnings.append(
+            f"{len(media.sidecars)} external subtitle sidecar(s) are not embedded automatically"
+        )
+    if media.field_order and media.field_order not in {"progressive", "unknown"}:
+        warnings.append(f"Interlaced field order detected: {media.field_order}")
+    if media.width >= 3840 or media.height >= 2160:
+        warnings.append(
+            "4K source detected; encoding may require substantial time and temporary space"
+        )
+    return warnings
 
 
 def output_path(
@@ -396,11 +551,29 @@ def handbrake_command(
     preset: str,
     extra_audio: Iterable[int] = (),
     extra_subtitles: Iterable[int] = (),
+    bit_depth: int = 10,
+    tune: str | None = None,
+    profile: str | None = None,
+    level: str | None = None,
+    crop: str = "auto",
+    deinterlace: str = "auto",
+    lossless: bool = False,
+    audio_tracks: Iterable[int] | None = None,
+    subtitle_tracks: Iterable[int] | None = None,
 ) -> list[str]:
-    audio = sorted(set(select_tracks(media.audio, audio_languages, original)) | set(extra_audio))
-    subtitles = sorted(
-        set(select_tracks(media.subtitles, subtitle_languages)) | set(extra_subtitles)
+    audio = (
+        sorted(set(audio_tracks))
+        if audio_tracks is not None
+        else sorted(set(select_tracks(media.audio, audio_languages, original)) | set(extra_audio))
     )
+    subtitles = (
+        sorted(set(subtitle_tracks))
+        if subtitle_tracks is not None
+        else sorted(set(select_tracks(media.subtitles, subtitle_languages)) | set(extra_subtitles))
+    )
+    encoders = {8: "x265", 10: "x265_10bit", 12: "x265_12bit"}
+    if bit_depth not in encoders:
+        raise BrakeSmithError("Bit depth must be 8, 10, or 12")
     command = [
         executable,
         "-i",
@@ -410,7 +583,7 @@ def handbrake_command(
         "--format",
         "av_mkv",
         "--encoder",
-        "x265_10bit",
+        encoders[bit_depth],
         "--quality",
         str(quality),
         "--encoder-preset",
@@ -421,6 +594,22 @@ def handbrake_command(
         "--audio-fallback",
         "av_aac",
     ]
+    if lossless:
+        command += ["--encopts", "lossless=1"]
+    if tune:
+        command += ["--encoder-tune", tune]
+    if profile:
+        command += ["--encoder-profile", profile]
+    if level:
+        command += ["--encoder-level", level]
+    if crop == "none":
+        command += ["--crop", "0:0:0:0"]
+    elif crop != "auto":
+        raise BrakeSmithError("Crop policy must be auto or none")
+    if deinterlace in {"decomb", "yadif"}:
+        command += [f"--{deinterlace}"]
+    elif deinterlace not in {"auto", "off"}:
+        raise BrakeSmithError("Deinterlace policy must be auto, off, decomb, or yadif")
     command += (
         ["--audio", ",".join(map(str, audio)), "--aencoder", "copy"]
         if audio

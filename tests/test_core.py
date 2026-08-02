@@ -163,3 +163,41 @@ def test_probe_cache_invalidates_changed_source(tmp_path: Path):
     assert ProbeCache(cache_path).get(source).codec == "h264"
     source.write_bytes(b"changed-size")
     assert ProbeCache(cache_path).get(source) is None
+
+
+def test_track_flags_and_title_filters():
+    tracks = [
+        Track(1, 1, "audio", "eng", title="Main"),
+        Track(2, 2, "audio", "eng", title="Director Commentary", commentary=True),
+        Track(3, 3, "audio", "fra", title="Description", visual_impaired=True),
+    ]
+    assert select_tracks(
+        tracks,
+        ["eng", "fra"],
+        keep_commentary=False,
+        exclude_titles=["description"],
+    ) == [1]
+
+
+def test_encoder_controls_are_explicit(tmp_path: Path):
+    media = MediaFile(tmp_path / "source.mkv", "h264", 10, 1)
+    command = handbrake_command(
+        "HandBrakeCLI",
+        media,
+        tmp_path / "output.part",
+        [],
+        [],
+        None,
+        18,
+        "slow",
+        bit_depth=12,
+        tune="grain",
+        crop="none",
+        deinterlace="yadif",
+        lossless=True,
+    )
+    assert "x265_12bit" in command
+    assert "grain" in command
+    assert "0:0:0:0" in command
+    assert "--yadif" in command
+    assert "lossless=1" in command
