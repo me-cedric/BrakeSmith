@@ -8,6 +8,7 @@ import signal
 import subprocess
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -32,9 +33,11 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from . import __version__
-from .config import load_profile, prefer_profile
+from .config import load_format_settings, load_profile, prefer_profile, save_format_settings
 from .core import (
+    FORMAT_PRESETS,
     BrakeSmithError,
+    FormatSettings,
     MediaFile,
     ProbeCache,
     ScanInterrupted,
@@ -42,6 +45,7 @@ from .core import (
     atomic_write_json,
     discover,
     ensure_source_unchanged,
+    expected_audio_track_count,
     fidelity_warnings,
     find_executable,
     handbrake_command,
@@ -51,8 +55,10 @@ from .core import (
     probe,
     quarantine_file,
     replacement_output_path,
+    resolve_format_settings,
     select_tracks,
     snapshot_source,
+    text_subtitle_tracks,
     validate_destinations,
     validate_output,
 )
@@ -492,33 +498,141 @@ def language_name(code: str) -> str:
     return str(language.name) if language else code.upper()
 
 
-def reconcile_quality_profile(
-    quality: float, preset: str, non_interactive: bool
-) -> tuple[float, str]:
-    if non_interactive:
-        return quality, preset
-    profiles = {
-        "highest": (16.0, "slow"),
-        "high": (18.0, "slow"),
-        "balanced": (20.0, "medium"),
-        "compact": (22.0, "medium"),
-        "custom": (quality, preset),
-    }
+@dataclass(frozen=True)
+class FormatChoice:
+    name: str
+    quality: float
+    preset: str
+    bit_depth: int
+    encoder_profile: Optional[str]
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "format_preset": self.name,
+            "quality": self.quality,
+            "preset": self.preset,
+            "bit_depth": self.bit_depth,
+            "encoder_profile": self.encoder_profile,
+        }
+
+
+FORMAT_LABELS = {
+    "recommended": "Recommended automatic (Recommended)",
+    "highest": "Highest practical quality",
+    "high": "High quality",
+    "compact": "Compact",
+}
+
+
+def format_description(name: str, choice: FormatChoice) -> str:
+    if name == "custom":
+        profile = choice.encoder_profile or "automatic profile"
+        return (
+            f"All files: H.265 {choice.bit_depth}-bit · RF {choice.quality:g} · "
+            f"{choice.preset} · {profile} · source audio passthrough · MKV"
+        )
+    values = FORMAT_PRESETS[name]
+    tiers = " · ".join(
+        f"{resolution} RF {quality:g}/{preset}"
+        for resolution, (quality, preset) in values.items()
+    )
+    return (
+        f"{tiers} · H.265 Main 10 · MKV · AAC stereo 160k + EAC3 surround "
+        "640k (4K 768k) · SRT/ASS passthrough · HDR metadata passthrough"
+    )
+
+
+def choice_from_payload(payload: dict[str, object], fallback: FormatChoice) -> FormatChoice:
+    name = str(payload.get("format_preset", fallback.name))
+    if name not in {*FORMAT_PRESETS, "custom"}:
+        raise BrakeSmithError(f"Unknown saved format preset: {name}")
+    return FormatChoice(
+        name,
+        float(payload.get("quality", fallback.quality)),
+        str(payload.get("preset", fallback.preset)),
+        int(payload.get("bit_depth", fallback.bit_depth)),
+        str(payload["encoder_profile"]) if payload.get("encoder_profile") else None,
+    )
+
+
+def reconcile_format_choice(
+    requested: Optional[str],
+    quality: float,
+    preset: str,
+    bit_depth: int,
+    encoder_profile: Optional[str],
+    non_interactive: bool,
+    settings_path: Optional[Path] = None,
+) -> FormatChoice:
+    fallback = FormatChoice(requested or "recommended", quality, preset, bit_depth, encoder_profile)
+    if fallback.name not in {*FORMAT_PRESETS, "custom"}:
+        raise BrakeSmithError(
+            f"--format-preset must be {', '.join([*FORMAT_PRESETS, 'custom'])}"
+        )
+    if non_interactive or requested:
+        return fallback
+
+    saved_payload = load_format_settings(settings_path)
+    if saved_payload:
+        saved = choice_from_payload(saved_payload, fallback)
+        action = questionary.select(
+            "Format settings",
+            choices=[
+                Choice(
+                    f"Use saved: {FORMAT_LABELS.get(saved.name, 'Custom')}",
+                    value="saved",
+                    description=format_description(saved.name, saved),
+                ),
+                Choice(
+                    "Change format settings",
+                    value="change",
+                    description="Review every profile and replace the saved default if wanted.",
+                ),
+            ],
+            default="saved",
+            instruction="(↑/↓ move, enter confirm; details follow cursor)",
+        ).ask()
+        if action is None:
+            raise BrakeSmithError("Format selection cancelled")
+        if action == "saved":
+            return saved
+
+    choices = [
+        Choice(
+            FORMAT_LABELS[name],
+            value=name,
+            description=format_description(name, fallback),
+        )
+        for name in FORMAT_PRESETS
+    ]
+    choices.append(
+        Choice(
+            f"Current CLI settings — RF {quality:g}, {preset}",
+            value="custom",
+            description=format_description("custom", fallback),
+        )
+    )
     answer = questionary.select(
-        "Choose quality profile",
-        choices=[
-            Choice("Highest practical quality — RF 16, slow", value="highest"),
-            Choice("High quality — RF 18, slow", value="high"),
-            Choice("Balanced — RF 20, medium", value="balanced"),
-            Choice("Compact — RF 22, medium", value="compact"),
-            Choice(f"Current CLI settings — RF {quality:g}, {preset}", value="custom"),
-        ],
-        default="highest",
-        instruction="(↑/↓ move, enter confirm)",
+        "Choose format preset",
+        choices=choices,
+        default="recommended",
+        instruction="(↑/↓ move, enter confirm; details follow cursor)",
     ).ask()
     if answer is None:
-        raise BrakeSmithError("Quality selection cancelled")
-    return profiles[answer]
+        raise BrakeSmithError("Format selection cancelled")
+    selected = FormatChoice(answer, quality, preset, bit_depth, encoder_profile)
+    if questionary.confirm("Save as the default for future runs?", default=True).ask():
+        saved_path = save_format_settings(selected.payload(), settings_path)
+        console.print(f"[dim]Saved format settings: {saved_path}[/]")
+    return selected
+
+
+def format_summary(settings: FormatSettings) -> str:
+    audio = "AAC 160k + EAC3 640k/768k when surround" if settings.library_audio else "copy"
+    return (
+        f"{settings.resolution} → x265 {settings.bit_depth}-bit, RF {settings.quality:g}, "
+        f"{settings.preset}, {settings.encoder_profile or 'auto profile'}, audio {audio}, MKV"
+    )
 
 
 def reconcile_max_files(configured: Optional[int], non_interactive: bool) -> Optional[int]:
@@ -657,6 +771,9 @@ def plan_batch(
     ),
     keep_original: bool = typer.Option(False, "--keep-original/--no-keep-original"),
     original_language: Optional[str] = typer.Option(None),
+    format_preset: Optional[str] = typer.Option(
+        None, help="recommended, highest, high, compact, or custom; default is interactive/saved."
+    ),
     quality: float = typer.Option(18.0, min=0, max=51),
     preset: str = typer.Option("slow"),
     bit_depth: int = typer.Option(10, min=8, max=12),
@@ -699,6 +816,10 @@ def plan_batch(
         unknown_subtitles = str(
             prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
         )
+        format_preset = prefer_profile(
+            profile_settings, "format_preset", format_preset, None
+        )
+        format_preset = str(format_preset) if format_preset else None
         quality = float(prefer_profile(profile_settings, "quality", quality, 18.0))
         preset = str(prefer_profile(profile_settings, "preset", preset, "slow"))
         bit_depth = int(prefer_profile(profile_settings, "bit_depth", bit_depth, 10))
@@ -715,7 +836,14 @@ def plan_batch(
         console.print("[red]Error:[/] HandBrakeCLI or ffprobe not found. Run `brakesmith doctor`.")
         raise typer.Exit(2)
     try:
-        quality, preset = reconcile_quality_profile(quality, preset, non_interactive)
+        format_choice = reconcile_format_choice(
+            format_preset,
+            quality,
+            preset,
+            bit_depth,
+            encoder_profile,
+            non_interactive,
+        )
         max_files = reconcile_max_files(max_files, non_interactive)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
@@ -776,6 +904,14 @@ def plan_batch(
         plan_items: list[dict[str, object]] = []
         destinations: list[tuple[Path, Path]] = []
         for item in items:
+            format_settings = resolve_format_settings(
+                item,
+                format_choice.name,
+                format_choice.quality,
+                format_choice.preset,
+                format_choice.bit_depth,
+                format_choice.encoder_profile,
+            )
             selected_audio = sorted(
                 set(
                     select_tracks(
@@ -821,6 +957,8 @@ def plan_batch(
                     or not set(selected_subtitles) <= valid_subtitles
                 ):
                     raise BrakeSmithError(f"Override references missing track for {item.path}")
+            if format_settings.library_audio:
+                selected_subtitles = text_subtitle_tracks(item, selected_subtitles)
             if item.audio and not selected_audio and not allow_no_audio:
                 raise BrakeSmithError(f"No audio selected for {item.path}; adjust policy")
             destination = (
@@ -847,8 +985,19 @@ def plan_batch(
                     "chapters": item.chapters,
                     "audio_tracks": selected_audio,
                     "subtitle_tracks": selected_subtitles,
+                    "expected_audio_tracks": expected_audio_track_count(
+                        item, selected_audio, format_settings.library_audio
+                    ),
                     "replace_source": replace_source,
                     "warnings": fidelity_warnings(item),
+                    "format": {
+                        "preset": format_settings.name,
+                        "resolution": format_settings.resolution,
+                        "quality": format_settings.quality,
+                        "encoder_preset": format_settings.preset,
+                        "bit_depth": format_settings.bit_depth,
+                        "encoder_profile": format_settings.encoder_profile,
+                    },
                     "command": handbrake_command(
                         executable,
                         item,
@@ -856,19 +1005,21 @@ def plan_batch(
                         audio_languages,
                         subtitle_languages,
                         originals[item.path],
-                        quality,
-                        preset,
+                        format_settings.quality,
+                        format_settings.preset,
                         extra_audio[item.path],
                         extra_subtitles[item.path],
-                        bit_depth,
+                        format_settings.bit_depth,
                         tune,
-                        encoder_profile,
+                        format_settings.encoder_profile,
                         encoder_level,
                         crop,
                         deinterlace,
                         lossless,
                         selected_audio,
                         selected_subtitles,
+                        format_settings.library_audio,
+                        format_settings.library_audio,
                     ),
                 }
             )
@@ -883,11 +1034,12 @@ def plan_batch(
             "root": str(directory),
             "ffprobe": ffprobe_executable,
             "settings": {
-                "quality": quality,
-                "preset": preset,
-                "bit_depth": bit_depth,
+                "format_preset": format_choice.name,
+                "quality": format_choice.quality,
+                "preset": format_choice.preset,
+                "bit_depth": format_choice.bit_depth,
                 "tune": tune,
-                "profile": encoder_profile,
+                "profile": format_choice.encoder_profile,
                 "level": encoder_level,
                 "crop": crop,
                 "deinterlace": deinterlace,
@@ -1006,7 +1158,9 @@ def execute_plan(
                             inode=int(raw_snapshot["inode"]),
                         )
                         replace_source = bool(item.get("replace_source", False))
-                        expected_audio = len(item["audio_tracks"])
+                        expected_audio = int(
+                            item.get("expected_audio_tracks", len(item["audio_tracks"]))
+                        )
                         expected_subtitles = len(item["subtitle_tracks"])
                         if not source.exists() and replace_source and destination.exists():
                             validate_output(
@@ -1292,6 +1446,9 @@ def run_batch(
     original_language: Optional[str] = typer.Option(
         None, help="Fallback original language for files lacking metadata."
     ),
+    format_preset: Optional[str] = typer.Option(
+        None, help="recommended, highest, high, compact, or custom; default is interactive/saved."
+    ),
     quality: float = typer.Option(
         18.0, min=0, max=51, help="x265 constant quality; lower is larger/better."
     ),
@@ -1346,6 +1503,10 @@ def run_batch(
         unknown_subtitles = str(
             prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
         )
+        format_preset = prefer_profile(
+            profile_settings, "format_preset", format_preset, None
+        )
+        format_preset = str(format_preset) if format_preset else None
         quality = float(prefer_profile(profile_settings, "quality", quality, 18.0))
         preset = str(prefer_profile(profile_settings, "preset", preset, "slow"))
         bit_depth = int(prefer_profile(profile_settings, "bit_depth", bit_depth, 10))
@@ -1368,7 +1529,14 @@ def run_batch(
         console.print("[red]Error:[/] --stale-partial must be fail, quarantine, or delete")
         raise typer.Exit(2)
     try:
-        quality, preset = reconcile_quality_profile(quality, preset, non_interactive)
+        format_choice = reconcile_format_choice(
+            format_preset,
+            quality,
+            preset,
+            bit_depth,
+            encoder_profile,
+            non_interactive,
+        )
         max_files = reconcile_max_files(max_files, non_interactive)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
@@ -1420,6 +1588,17 @@ def run_batch(
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
     excluded_titles = [value.strip() for value in exclude_titles.split(",") if value.strip()]
+    formats = {
+        item.path: resolve_format_settings(
+            item,
+            format_choice.name,
+            format_choice.quality,
+            format_choice.preset,
+            format_choice.bit_depth,
+            format_choice.encoder_profile,
+        )
+        for item in items
+    }
     selected_audio: dict[Path, list[int]] = {}
     selected_subtitles: dict[Path, list[int]] = {}
     for item in items:
@@ -1449,6 +1628,8 @@ def run_batch(
             )
             | extra_subtitles[item.path]
         )
+        if formats[item.path].library_audio:
+            kept_subs = text_subtitle_tracks(item, kept_subs)
         if item.audio and not kept_audio and not allow_no_audio:
             console.print(
                 f"[red]Error:[/] No audio selected for {item.path}; choose a language, keep an "
@@ -1458,10 +1639,18 @@ def run_batch(
         selected_audio[item.path] = kept_audio
         selected_subtitles[item.path] = kept_subs
         console.print(
-            f"{item.path.name}: audio {kept_audio or 'none'}, subtitles {kept_subs or 'none'}, original {originals[item.path] or 'unknown'}"
+            f"{item.path.name}: {format_summary(formats[item.path])}; "
+            f"audio sources {kept_audio or 'none'}, subtitles {kept_subs or 'none'}, "
+            f"original {originals[item.path] or 'unknown'}"
         )
         for warning in fidelity_warnings(item):
             console.print(f"[yellow]Warning:[/] {item.path.name}: {warning}")
+    expected_audio_tracks = {
+        item.path: expected_audio_track_count(
+            item, selected_audio[item.path], formats[item.path].library_audio
+        )
+        for item in items
+    }
     destinations = {
         item.path: (
             replacement_output_path(item.path, output_directory, directory)
@@ -1525,7 +1714,7 @@ def run_batch(
                             destination,
                             ffprobe_executable,
                             item.duration,
-                            len(selected_audio[item.path]),
+                            expected_audio_tracks[item.path],
                             len(selected_subtitles[item.path]),
                             item.chapters,
                         )
@@ -1612,7 +1801,7 @@ def run_batch(
                             partial,
                             ffprobe_executable,
                             item.duration,
-                            len(selected_audio[item.path]),
+                            expected_audio_tracks[item.path],
                             len(selected_subtitles[item.path]),
                             item.chapters,
                         )
@@ -1651,19 +1840,21 @@ def run_batch(
                     audio_languages,
                     subtitle_languages,
                     originals[item.path],
-                    quality,
-                    preset,
+                    formats[item.path].quality,
+                    formats[item.path].preset,
                     extra_audio[item.path],
                     extra_subtitles[item.path],
-                    bit_depth,
+                    formats[item.path].bit_depth,
                     tune,
-                    encoder_profile,
+                    formats[item.path].encoder_profile,
                     encoder_level,
                     crop,
                     deinterlace,
                     lossless,
                     selected_audio[item.path],
                     selected_subtitles[item.path],
+                    formats[item.path].library_audio,
+                    formats[item.path].library_audio,
                 )
                 process: Optional[subprocess.Popen[str]] = None
                 diagnostics: list[str] = []
@@ -1693,7 +1884,7 @@ def run_batch(
                         partial,
                         ffprobe_executable,
                         item.duration,
-                        len(selected_audio[item.path]),
+                        expected_audio_tracks[item.path],
                         len(selected_subtitles[item.path]),
                         item.chapters,
                     )

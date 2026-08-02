@@ -10,14 +10,17 @@ from brakesmith.core import (
     ProbeCache,
     Track,
     atomic_write_json,
+    content_resolution,
     discover,
     ensure_source_unchanged,
+    expected_audio_track_count,
     handbrake_command,
     normalize_languages,
     output_path,
     probe,
     quarantine_file,
     replacement_output_path,
+    resolve_format_settings,
     select_tracks,
     snapshot_source,
     validate_destinations,
@@ -273,3 +276,82 @@ def test_encoder_controls_are_explicit(tmp_path: Path):
     assert "0:0:0:0" in command
     assert "--yadif" in command
     assert "lossless=1" in command
+
+
+def test_recommended_format_autodetects_resolution():
+    cases = [(480, "480p", 22), (720, "720p", 21), (1080, "1080p", 20), (2160, "4k", 18)]
+    for height, resolution, quality in cases:
+        media = MediaFile(Path("movie.mkv"), "h264", 10, 1, width=height * 16 // 9, height=height)
+        settings = resolve_format_settings(media, "recommended", 30, "fast", 8, None)
+        assert content_resolution(media) == resolution
+        assert settings.quality == quality
+        assert settings.bit_depth == 10
+        assert settings.encoder_profile == "main10"
+
+
+def test_recommended_command_builds_audio_variants_and_text_subtitles(tmp_path: Path):
+    media = MediaFile(
+        tmp_path / "movie.mkv",
+        "h264",
+        10,
+        1,
+        audio=[Track(1, 1, "audio", "eng", channels=6)],
+        subtitles=[
+            Track(2, 1, "subtitle", "eng", codec="subrip"),
+            Track(3, 2, "subtitle", "eng", codec="hdmv_pgs_subtitle"),
+        ],
+        width=1920,
+        height=1080,
+    )
+    settings = resolve_format_settings(media, "recommended", 18, "slow", 10, None)
+    command = handbrake_command(
+        "HandBrakeCLI",
+        media,
+        tmp_path / "out.part",
+        ["eng"],
+        ["eng"],
+        None,
+        settings.quality,
+        settings.preset,
+        bit_depth=settings.bit_depth,
+        profile=settings.encoder_profile,
+        library_audio=True,
+        text_subtitles_only=True,
+    )
+    assert command[command.index("--quality") + 1] == "20.0"
+    assert command[command.index("--audio") + 1] == "1,1"
+    assert command[command.index("--ab") + 1] == "160,640"
+    assert command[command.index("--mixdown") + 1] == "stereo,5point1"
+    assert command[command.index("--subtitle") + 1] == "1"
+    assert expected_audio_track_count(media, [1], True) == 2
+
+
+def test_4k_hdr_preset_puts_eac3_first_and_preserves_metadata(tmp_path: Path):
+    media = MediaFile(
+        tmp_path / "movie.mkv",
+        "h264",
+        10,
+        1,
+        audio=[Track(1, 1, "audio", "eng", channels=8)],
+        width=3840,
+        height=2160,
+        hdr=True,
+    )
+    settings = resolve_format_settings(media, "recommended", 20, "fast", 8, None)
+    command = handbrake_command(
+        "HandBrakeCLI",
+        media,
+        tmp_path / "out.part",
+        ["eng"],
+        [],
+        None,
+        settings.quality,
+        settings.preset,
+        bit_depth=settings.bit_depth,
+        profile=settings.encoder_profile,
+        library_audio=True,
+    )
+    assert command[command.index("--quality") + 1] == "18.0"
+    assert command[command.index("--ab") + 1] == "768,160"
+    assert command[command.index("--mixdown") + 1] == "5point1,stereo"
+    assert command[command.index("--hdr-dynamic-metadata") + 1] == "all"

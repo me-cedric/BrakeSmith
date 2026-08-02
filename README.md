@@ -27,9 +27,9 @@ It is review-first. Output is written to a temporary file and published only aft
 - Original-language detection from container metadata when `--keep-original` is requested.
 - One batch selection for unlabelled audio and subtitles.
 - Explicit non-interactive fallback with `--original-language`.
-- H.265/x265 10-bit constant-quality encoding; conservative quality 18 and `slow` preset.
-- Audio passthrough when MKV supports the source codec, with AAC fallback.
-- Subtitle passthrough, chapters, and metadata-friendly MKV output.
+- Resolution-aware H.265/x265 Main 10 presets for 480p, 720p, 1080p, and 4K.
+- AAC stereo plus EAC3 surround library audio; 4K surround gets 768 kbps.
+- SRT/ASS subtitle passthrough, chapters, and metadata-friendly MKV output.
 - Live discovery, metadata-analysis, per-file, and total progress with timing.
 - Ctrl+C cancellation removes only incomplete output.
 - Existing output is skipped, making interrupted batches safe to resume.
@@ -132,7 +132,9 @@ Review and convert:
 brakesmith run
 ```
 
-Interactive runs first ask for a quality profile, defaulting to highest practical quality (RF 16, slow), then ask how many files to propose, defaulting to one. After scanning, one global picker lists full language names and audio/subtitle counts. Use arrow keys and Space, then press Enter. English and French start selected; detected extras start unchecked.
+Interactive runs first ask for a format preset. `Recommended automatic` is marked and selected by default. Moving the cursor over a preset shows its resolution-specific video, audio, container, subtitle, and HDR details. The selection can be saved; later runs offer `Use saved` to continue immediately or `Change format settings`.
+
+BrakeSmith detects every file independently, so one mixed batch can use 480p, 720p, 1080p, and 4K settings automatically. It then asks how many files to propose, defaulting to one. After scanning, one global picker lists full language names and audio/subtitle counts. Use arrow keys and Space, then press Enter.
 
 Tdarr-style in-place library conversion:
 
@@ -145,7 +147,7 @@ Each successful file becomes MKV/HEVC, unselected streams and image/data attachm
 For unattended runs, prompts stay disabled and explicit settings apply:
 
 ```sh
-brakesmith run /smb --replace-source --max-files 5 --quality 18 --preset slow --non-interactive --unknown-audio keep --unknown-subtitles drop --yes
+brakesmith run /smb --replace-source --max-files 5 --format-preset recommended --non-interactive --unknown-audio keep --unknown-subtitles drop --yes
 ```
 
 Scan another directory:
@@ -259,6 +261,7 @@ Example `~/.config/brakesmith/config.toml`:
 
 ```toml
 [profiles.archive]
+format_preset = "custom"
 audio = "eng,fra"
 subtitles = "eng,fra"
 unknown_audio = "language:eng"
@@ -272,14 +275,25 @@ probe_timeout = 60
 
 Use it with `brakesmith plan ... --profile archive` or `brakesmith run ... --profile archive`. Explicit CLI values win over profile defaults.
 
-Quality examples:
+Built-in format presets:
+
+| Profile | 480p | 720p | 1080p | 4K |
+| --- | --- | --- | --- | --- |
+| Recommended automatic | RF 22, medium | RF 21, medium | RF 20, medium | RF 18, slow |
+| Highest practical quality | RF 18, slow | RF 17, slow | RF 16, slow | RF 16, slow |
+| High quality | RF 20, slow | RF 19, slow | RF 18, slow | RF 18, slow |
+| Compact | RF 25, medium | RF 24, medium | RF 22, medium | RF 20, medium |
+
+All built-in presets use H.265/x265 Main 10 in MKV. Each chosen surround source becomes AAC stereo 160 kbps plus EAC3 5.1 at 640 kbps; 4K puts EAC3 first at 768 kbps. Stereo sources become AAC stereo 160 kbps. SRT/ASS subtitles are kept; bitmap subtitles are omitted. HDR inputs enable dynamic-metadata passthrough.
+
+Custom quality examples:
 
 ```sh
-brakesmith run . --quality 16 --preset slower  # larger, slower, higher quality
-brakesmith run . --quality 20 --preset medium  # smaller and faster
+brakesmith run . --format-preset custom --quality 16 --preset slower
+brakesmith run . --format-preset custom --quality 20 --preset medium
 ```
 
-Constant-quality encoding is inherently lossy. Quality 18 is visually transparent for many sources, not mathematically lossless. Audio is copied when possible. Use a lower quality number if preservation matters more than size.
+Constant-quality encoding is inherently lossy. Lower RF means higher quality and larger output. RF 18–20 is recommended for most 1080p/4K libraries; use `custom` when you need exact encoder values. Custom mode retains the previous source-audio passthrough behavior.
 
 ## SMB and network shares
 

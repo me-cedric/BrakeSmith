@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -133,6 +134,102 @@ class MediaFile:
     @property
     def should_convert(self) -> bool:
         return self.codec not in {"hevc", "h265"}
+
+
+@dataclass(frozen=True)
+class FormatSettings:
+    name: str
+    resolution: str
+    quality: float
+    preset: str
+    bit_depth: int
+    encoder_profile: str | None
+    library_audio: bool
+
+
+FORMAT_PRESETS: dict[str, dict[str, tuple[float, str]]] = {
+    "recommended": {
+        "480p": (22.0, "medium"),
+        "720p": (21.0, "medium"),
+        "1080p": (20.0, "medium"),
+        "4k": (18.0, "slow"),
+    },
+    "highest": {
+        "480p": (18.0, "slow"),
+        "720p": (17.0, "slow"),
+        "1080p": (16.0, "slow"),
+        "4k": (16.0, "slow"),
+    },
+    "high": {
+        "480p": (20.0, "slow"),
+        "720p": (19.0, "slow"),
+        "1080p": (18.0, "slow"),
+        "4k": (18.0, "slow"),
+    },
+    "compact": {
+        "480p": (25.0, "medium"),
+        "720p": (24.0, "medium"),
+        "1080p": (22.0, "medium"),
+        "4k": (20.0, "medium"),
+    },
+}
+TEXT_SUBTITLE_CODECS = {"ass", "ssa", "srt", "subrip"}
+
+
+def content_resolution(media: MediaFile) -> str:
+    height = media.height or round(media.width * 9 / 16)
+    if not height:
+        return "1080p"
+    if height <= 576:
+        return "480p"
+    if height <= 900:
+        return "720p"
+    if height <= 1440:
+        return "1080p"
+    return "4k"
+
+
+def resolve_format_settings(
+    media: MediaFile,
+    name: str,
+    quality: float,
+    preset: str,
+    bit_depth: int,
+    encoder_profile: str | None,
+) -> FormatSettings:
+    resolution = content_resolution(media)
+    if name == "custom":
+        return FormatSettings(
+            name, resolution, quality, preset, bit_depth, encoder_profile, False
+        )
+    if name not in FORMAT_PRESETS:
+        raise BrakeSmithError(f"Unknown format preset: {name}")
+    resolved_quality, resolved_preset = FORMAT_PRESETS[name][resolution]
+    return FormatSettings(
+        name, resolution, resolved_quality, resolved_preset, 10, "main10", True
+    )
+
+
+def text_subtitle_tracks(media: MediaFile, selected: Iterable[int]) -> list[int]:
+    selected_ids = set(selected)
+    return [
+        track.type_index
+        for track in media.subtitles
+        if track.type_index in selected_ids and track.codec.casefold() in TEXT_SUBTITLE_CODECS
+    ]
+
+
+def expected_audio_track_count(
+    media: MediaFile, selected: Iterable[int], library_audio: bool
+) -> int:
+    selected_ids = set(selected)
+    if not library_audio:
+        return len(selected_ids)
+    return sum(
+        2 if track.channels > 2 else 1
+        for track in media.audio
+        if track.type_index in selected_ids
+    )
 
 
 def snapshot_source(path: Path) -> SourceSnapshot:
@@ -623,6 +720,8 @@ def handbrake_command(
     lossless: bool = False,
     audio_tracks: Iterable[int] | None = None,
     subtitle_tracks: Iterable[int] | None = None,
+    library_audio: bool = False,
+    text_subtitles_only: bool = False,
 ) -> list[str]:
     audio = (
         sorted(set(audio_tracks))
@@ -634,6 +733,8 @@ def handbrake_command(
         if subtitle_tracks is not None
         else sorted(set(select_tracks(media.subtitles, subtitle_languages)) | set(extra_subtitles))
     )
+    if text_subtitles_only:
+        subtitles = text_subtitle_tracks(media, subtitles)
     encoders = {8: "x265", 10: "x265_10bit", 12: "x265_12bit"}
     if bit_depth not in encoders:
         raise BrakeSmithError("Bit depth must be 8, 10, or 12")
@@ -652,11 +753,9 @@ def handbrake_command(
         "--encoder-preset",
         preset,
         "--markers",
-        "--audio-copy-mask",
-        "aac,ac3,eac3,truehd,dts,dtshd,mp3,flac",
-        "--audio-fallback",
-        "av_aac",
     ]
+    if media.hdr or media.dolby_vision:
+        command += ["--hdr-dynamic-metadata", "all"]
     if lossless:
         command += ["--encopts", "lossless=1"]
     if tune:
@@ -673,11 +772,50 @@ def handbrake_command(
         command += [f"--{deinterlace}"]
     elif deinterlace not in {"auto", "off"}:
         raise BrakeSmithError("Deinterlace policy must be auto, off, decomb, or yadif")
-    command += (
-        ["--audio", ",".join(map(str, audio)), "--aencoder", "copy"]
-        if audio
-        else ["--audio", "none"]
-    )
+    if audio and library_audio:
+        aac_encoder = "ca_aac" if sys.platform == "darwin" else "av_aac"
+        source_tracks = {track.type_index: track for track in media.audio}
+        audio_inputs: list[int] = []
+        audio_encoders: list[str] = []
+        audio_bitrates: list[int] = []
+        audio_mixdowns: list[str] = []
+        for track_number in audio:
+            surround = source_tracks.get(track_number) and source_tracks[track_number].channels > 2
+            variants = (
+                [("eac3", 768, "5point1"), (aac_encoder, 160, "stereo")]
+                if surround and content_resolution(media) == "4k"
+                else [(aac_encoder, 160, "stereo"), ("eac3", 640, "5point1")]
+                if surround
+                else [(aac_encoder, 160, "stereo")]
+            )
+            for encoder, bitrate, mixdown in variants:
+                audio_inputs.append(track_number)
+                audio_encoders.append(encoder)
+                audio_bitrates.append(bitrate)
+                audio_mixdowns.append(mixdown)
+        command += [
+            "--audio",
+            ",".join(map(str, audio_inputs)),
+            "--aencoder",
+            ",".join(audio_encoders),
+            "--ab",
+            ",".join(map(str, audio_bitrates)),
+            "--mixdown",
+            ",".join(audio_mixdowns),
+        ]
+    elif audio:
+        command += [
+            "--audio",
+            ",".join(map(str, audio)),
+            "--aencoder",
+            "copy",
+            "--audio-copy-mask",
+            "aac,ac3,eac3,truehd,dts,dtshd,mp3,flac",
+            "--audio-fallback",
+            "av_aac",
+        ]
+    else:
+        command += ["--audio", "none"]
     command += (
         ["--subtitle", ",".join(map(str, subtitles))] if subtitles else ["--subtitle", "none"]
     )

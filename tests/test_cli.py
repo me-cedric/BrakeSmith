@@ -33,7 +33,7 @@ def test_discard_not_smaller_keeps_only_smaller_output(tmp_path: Path):
     assert not equal.exists()
 
 
-def test_batch_setup_prompts_default_to_highest_quality_and_one_file(monkeypatch):
+def test_batch_setup_defaults_to_recommended_and_can_save(monkeypatch, tmp_path: Path):
     class Answer:
         def __init__(self, value):
             self.value = value
@@ -42,9 +42,12 @@ def test_batch_setup_prompts_default_to_highest_quality_and_one_file(monkeypatch
             return self.value
 
     def select(*args, **kwargs):
-        assert kwargs["default"] == "highest"
-        assert kwargs["choices"][0].title.startswith("Highest practical quality")
-        return Answer("highest")
+        assert kwargs["default"] == "recommended"
+        recommended = kwargs["choices"][0]
+        assert "Recommended" in recommended.title
+        assert "1080p RF 20/medium" in recommended.description
+        assert "4k RF 18/slow" in recommended.description
+        return Answer("recommended")
 
     def text(*args, **kwargs):
         assert kwargs["default"] == "1"
@@ -54,11 +57,43 @@ def test_batch_setup_prompts_default_to_highest_quality_and_one_file(monkeypatch
 
     monkeypatch.setattr(cli.questionary, "select", select)
     monkeypatch.setattr(cli.questionary, "text", text)
+    monkeypatch.setattr(cli.questionary, "confirm", lambda *args, **kwargs: Answer(True))
 
-    assert cli.reconcile_quality_profile(18, "slow", False) == (16, "slow")
+    settings = tmp_path / "format.json"
+    choice = cli.reconcile_format_choice(None, 18, "slow", 10, None, False, settings)
+    assert choice.name == "recommended"
+    assert json.loads(settings.read_text())["format_preset"] == "recommended"
     assert cli.reconcile_max_files(None, False) == 1
-    assert cli.reconcile_quality_profile(21, "fast", True) == (21, "fast")
+    assert cli.reconcile_format_choice(None, 21, "fast", 8, None, True).name == "recommended"
     assert cli.reconcile_max_files(5, True) == 5
+
+
+def test_saved_format_can_continue_without_reopening_profiles(monkeypatch, tmp_path: Path):
+    settings = tmp_path / "format.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "format_preset": "compact",
+                "quality": 18,
+                "preset": "slow",
+                "bit_depth": 10,
+                "encoder_profile": None,
+            }
+        )
+    )
+
+    class Answer:
+        def ask(self):
+            return "saved"
+
+    def select(*args, **kwargs):
+        assert kwargs["default"] == "saved"
+        assert kwargs["choices"][0].title.startswith("Use saved: Compact")
+        return Answer()
+
+    monkeypatch.setattr(cli.questionary, "select", select)
+    choice = cli.reconcile_format_choice(None, 18, "slow", 10, None, False, settings)
+    assert choice.name == "compact"
 
 
 def test_candidates_exports_only_non_hevc(tmp_path: Path, monkeypatch):

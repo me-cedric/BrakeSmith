@@ -58,5 +58,5 @@ jobs:
       - name: Create fixture and encode it
         run: |
           ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=160x90:rate=12:duration=1 -f lavfi -i sine=duration=1 -map 0:v -map 1:a -c:v libx264 -c:a aac -metadata:s:a:0 language=eng fixture.mkv
-          brakesmith run . --no-keep-original --unknown-audio drop --unknown-subtitles drop --quality 30 --preset ultrafast --yes --non-interactive
+          brakesmith run . --no-keep-original --unknown-audio drop --unknown-subtitles drop --format-preset custom --quality 30 --preset ultrafast --yes --non-interactive
           ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1 fixture.brakesmith.mkv | grep codec_name=hevc
