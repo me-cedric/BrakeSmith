@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import re
+import signal
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -19,12 +20,16 @@ from .core import (
     BrakeSmithError,
     MediaFile,
     discover,
+    ensure_source_unchanged,
     find_executable,
     handbrake_command,
     normalize_languages,
     output_path,
+    preflight_destination,
     probe,
     select_tracks,
+    snapshot_source,
+    validate_destinations,
 )
 
 app = typer.Typer(
@@ -252,6 +257,25 @@ def reconcile_unknown_tracks(
     return result
 
 
+def terminate_process(process: Optional[subprocess.Popen[str]]) -> None:
+    if not process or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def cleanup_partial(path: Path) -> Optional[str]:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        return f"Could not remove partial output {path}: {error}"
+    return None
+
+
 @app.command(name="run")
 def run_batch(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
@@ -278,6 +302,9 @@ def run_batch(
         None, help="Mirror results under another directory."
     ),
     include_hevc: bool = typer.Option(False, help="Reprocess files already encoded as HEVC."),
+    allow_no_audio: bool = typer.Option(
+        False, help="Allow output without audio even when source has audio."
+    ),
     extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
     yes: bool = typer.Option(
         False, "--yes", "-y", help="Skip final confirmation; unresolved originals still fail."
@@ -307,6 +334,8 @@ def run_batch(
         raise typer.Exit(2)
     audio_languages = normalize_languages(audio.split(","))
     subtitle_languages = normalize_languages(subtitles.split(","))
+    selected_audio: dict[Path, list[int]] = {}
+    selected_subtitles: dict[Path, list[int]] = {}
     for item in items:
         kept_audio = sorted(
             set(select_tracks(item.audio, audio_languages, originals[item.path]))
@@ -315,90 +344,127 @@ def run_batch(
         kept_subs = sorted(
             set(select_tracks(item.subtitles, subtitle_languages)) | extra_subtitles[item.path]
         )
+        if item.audio and not kept_audio and not allow_no_audio:
+            console.print(
+                f"[red]Error:[/] No audio selected for {item.path}; choose a language, keep an "
+                "unlabelled track, or pass --allow-no-audio."
+            )
+            raise typer.Exit(2)
+        selected_audio[item.path] = kept_audio
+        selected_subtitles[item.path] = kept_subs
         console.print(
             f"{item.path.name}: audio {kept_audio or 'none'}, subtitles {kept_subs or 'none'}, original {originals[item.path] or 'unknown'}"
         )
+    destinations = {
+        item.path: output_path(item.path, output_directory, directory) for item in items
+    }
+    try:
+        validate_destinations([(item.path, destinations[item.path]) for item in items])
+        snapshots = {item.path: snapshot_source(item.path) for item in items}
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
     if not yes and not Confirm.ask(
         f"Convert {len(items)} file(s)? Originals will remain untouched", default=False
     ):
         console.print("Cancelled. No files changed.")
         return
 
+    try:
+        for item in items:
+            preflight_destination(destinations[item.path], item.size)
+            ensure_source_unchanged(snapshots[item.path])
+    except BrakeSmithError as error:
+        console.print(f"[red]Preflight failed:[/] {error}")
+        raise typer.Exit(2)
+
     progress_pattern = re.compile(r"(\d+(?:\.\d+)?)\s*%")
     failures = 0
     completed = 0
     skipped = 0
-    with Progress(
-        TextColumn("{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        total_task = progress.add_task("Total", total=len(items))
-        for item in items:
-            destination = output_path(item.path, output_directory, directory)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            partial = destination.with_name(destination.name + ".part")
-            if destination.exists():
-                console.print(f"[yellow]Skip:[/] {destination} exists")
-                skipped += 1
-                progress.advance(total_task)
-                continue
-            if partial.exists():
-                partial.unlink()
-                console.print(f"[yellow]Cleaned stale partial:[/] {partial}")
-            file_task = progress.add_task(item.path.name, total=100)
-            command = handbrake_command(
-                executable,
-                item,
-                partial,
-                audio_languages,
-                subtitle_languages,
-                originals[item.path],
-                quality,
-                preset,
-                extra_audio[item.path],
-                extra_subtitles[item.path],
-            )
-            process: Optional[subprocess.Popen[str]] = None
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    errors="replace",
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def request_cancel(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, request_cancel)
+    try:
+        with Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            total_task = progress.add_task("Total", total=len(items))
+            for item in items:
+                destination = destinations[item.path]
+                ensure_source_unchanged(snapshots[item.path])
+                partial = destination.with_name(destination.name + ".part")
+                if destination.exists():
+                    console.print(f"[yellow]Skip:[/] {destination} exists")
+                    skipped += 1
+                    progress.advance(total_task)
+                    continue
+                if partial.exists():
+                    cleanup_error = cleanup_partial(partial)
+                    if cleanup_error:
+                        raise BrakeSmithError(cleanup_error)
+                    console.print(f"[yellow]Cleaned stale partial:[/] {partial}")
+                file_task = progress.add_task(item.path.name, total=100)
+                command = handbrake_command(
+                    executable,
+                    item,
+                    partial,
+                    audio_languages,
+                    subtitle_languages,
+                    originals[item.path],
+                    quality,
+                    preset,
+                    extra_audio[item.path],
+                    extra_subtitles[item.path],
                 )
-                assert process.stdout is not None
-                for line in process.stdout:
-                    match = progress_pattern.search(line)
-                    if match:
-                        progress.update(file_task, completed=min(float(match.group(1)), 100))
-                if process.wait() != 0:
-                    raise BrakeSmithError(f"HandBrake failed for {item.path.name}")
-                partial.replace(destination)
-                completed += 1
-                progress.update(file_task, completed=100)
-            except KeyboardInterrupt:
-                if process:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                partial.unlink(missing_ok=True)
-                console.print(
-                    "\n[yellow]Cancelled.[/] Partial output removed; originals untouched."
-                )
-                raise typer.Exit(130)
-            except BrakeSmithError as error:
-                partial.unlink(missing_ok=True)
-                failures += 1
-                console.print(f"[red]Failed:[/] {error}")
-            finally:
-                progress.remove_task(file_task)
-                progress.advance(total_task)
+                process: Optional[subprocess.Popen[str]] = None
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        errors="replace",
+                    )
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        match = progress_pattern.search(line)
+                        if match:
+                            progress.update(file_task, completed=min(float(match.group(1)), 100))
+                    if process.wait() != 0:
+                        raise BrakeSmithError(f"HandBrake failed for {item.path.name}")
+                    ensure_source_unchanged(snapshots[item.path])
+                    partial.replace(destination)
+                    completed += 1
+                    progress.update(file_task, completed=100)
+                except KeyboardInterrupt:
+                    terminate_process(process)
+                    cleanup_error = cleanup_partial(partial)
+                    console.print(
+                        "\n[yellow]Cancelled.[/] Partial output cleanup attempted; originals untouched."
+                    )
+                    if cleanup_error:
+                        console.print(f"[red]Warning:[/] {cleanup_error}")
+                    raise typer.Exit(130)
+                except Exception as error:  # noqa: BLE001 - cleanup must cover filesystem failures
+                    terminate_process(process)
+                    cleanup_error = cleanup_partial(partial)
+                    failures += 1
+                    console.print(f"[red]Failed:[/] {error}")
+                    if cleanup_error:
+                        console.print(f"[red]Warning:[/] {cleanup_error}")
+                finally:
+                    progress.remove_task(file_task)
+                    progress.advance(total_task)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
     console.print(
         f"[green]Done:[/] {completed} completed, {skipped} skipped, {failures} failed. "
         "Originals untouched."

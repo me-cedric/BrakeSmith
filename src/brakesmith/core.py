@@ -50,6 +50,15 @@ class BrakeSmithError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SourceSnapshot:
+    path: Path
+    size: int
+    modified_ns: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class Track:
     index: int
     type_index: int
@@ -71,6 +80,53 @@ class MediaFile:
     @property
     def should_convert(self) -> bool:
         return self.codec not in {"hevc", "h265"}
+
+
+def snapshot_source(path: Path) -> SourceSnapshot:
+    try:
+        stat = path.stat()
+    except OSError as error:
+        raise BrakeSmithError(f"Cannot stat source {path}: {error}") from error
+    if not path.is_file():
+        raise BrakeSmithError(f"Source is no longer a regular file: {path}")
+    return SourceSnapshot(path, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+
+
+def ensure_source_unchanged(expected: SourceSnapshot) -> None:
+    actual = snapshot_source(expected.path)
+    if actual != expected:
+        raise BrakeSmithError(f"Source changed since review: {expected.path}")
+
+
+def validate_destinations(destinations: list[tuple[Path, Path]]) -> None:
+    seen: dict[str, Path] = {}
+    for source, destination in destinations:
+        key = str(destination.resolve()).casefold()
+        previous = seen.get(key)
+        if previous and previous != source:
+            raise BrakeSmithError(
+                f"Output collision: {previous} and {source} both map to {destination}"
+            )
+        if source.resolve() == destination.resolve():
+            raise BrakeSmithError(f"Output would replace source: {source}")
+        seen[key] = source
+
+
+def preflight_destination(destination: Path, expected_bytes: int) -> None:
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not os.access(destination.parent, os.W_OK):
+            raise BrakeSmithError(f"Output directory is not writable: {destination.parent}")
+        free = shutil.disk_usage(destination.parent).free
+    except OSError as error:
+        raise BrakeSmithError(
+            f"Cannot prepare output directory {destination.parent}: {error}"
+        ) from error
+    required = max(expected_bytes, 512 * 1024 * 1024)
+    if free < required:
+        raise BrakeSmithError(
+            f"Insufficient free space for {destination}: need at least {required} bytes, have {free}"
+        )
 
 
 def normalize_languages(values: Iterable[str]) -> list[str]:

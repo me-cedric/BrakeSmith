@@ -7,10 +7,13 @@ from brakesmith.core import (
     MediaFile,
     Track,
     discover,
+    ensure_source_unchanged,
     handbrake_command,
     normalize_languages,
     output_path,
     select_tracks,
+    snapshot_source,
+    validate_destinations,
 )
 
 
@@ -97,3 +100,20 @@ def test_command_can_keep_reconciled_unknown_tracks(tmp_path: Path):
     )
     assert command[command.index("--audio") + 1] == "1"
     assert command[command.index("--subtitle") + 1] == "1"
+
+
+def test_source_snapshot_detects_change(tmp_path: Path):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"before")
+    snapshot = snapshot_source(source)
+    source.write_bytes(b"after-change")
+    with pytest.raises(BrakeSmithError, match="Source changed"):
+        ensure_source_unchanged(snapshot)
+
+
+def test_destination_collision_is_rejected(tmp_path: Path):
+    destination = tmp_path / "movie.brakesmith.mkv"
+    with pytest.raises(BrakeSmithError, match="Output collision"):
+        validate_destinations(
+            [(tmp_path / "movie.mp4", destination), (tmp_path / "movie.avi", destination)]
+        )
