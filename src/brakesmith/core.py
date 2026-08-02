@@ -50,6 +50,13 @@ class BrakeSmithError(RuntimeError):
     pass
 
 
+class ScanInterrupted(BrakeSmithError):
+    def __init__(self, items: list[MediaFile], errors: list[str]):
+        super().__init__(f"Scan cancelled after {len(items)} completed probes")
+        self.items = items
+        self.errors = errors
+
+
 @dataclass(frozen=True)
 class SourceSnapshot:
     path: Path
@@ -222,7 +229,10 @@ def find_executable(name: str, explicit: Path | None = None) -> str | None:
 
 
 def discover(
-    root: Path, max_depth: int | None = None, extra_extensions: Iterable[str] = ()
+    root: Path,
+    max_depth: int | None = None,
+    extra_extensions: Iterable[str] = (),
+    errors: list[str] | None = None,
 ) -> list[Path]:
     root = root.expanduser().resolve()
     if not root.is_dir():
@@ -232,7 +242,12 @@ def discover(
         for value in extra_extensions
     }
     found = []
-    for current, dirs, files in os.walk(root):
+
+    def record_error(error: OSError) -> None:
+        if errors is not None:
+            errors.append(str(error))
+
+    for current, dirs, files in os.walk(root, onerror=record_error):
         relative = Path(current).relative_to(root)
         depth = len(relative.parts)
         if max_depth is not None and depth >= max_depth:
@@ -244,12 +259,19 @@ def discover(
     return sorted(found, key=lambda path: str(path).lower())
 
 
-def probe(path: Path, ffprobe: str = "ffprobe") -> MediaFile:
+def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFile:
     command = [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=True, timeout=timeout
+        )
         data = json.loads(result.stdout)
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as error:
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        OSError,
+    ) as error:
         raise BrakeSmithError(f"Cannot inspect {path}: {error}") from error
     video = next(
         (stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"), {}
@@ -285,6 +307,64 @@ def probe(path: Path, ffprobe: str = "ffprobe") -> MediaFile:
         subtitles=tracks["subtitle"],
         original_language=normalized_original,
     )
+
+
+def default_cache_path() -> Path:
+    configured = os.environ.get("XDG_CACHE_HOME")
+    root = Path(configured).expanduser() if configured else Path.home() / ".cache"
+    return root / "brakesmith" / "probe-cache.json"
+
+
+class ProbeCache:
+    def __init__(self, path: Path | None = None):
+        self.path = (path or default_cache_path()).expanduser().resolve()
+        self.entries: dict[str, dict[str, object]] = {}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if payload.get("version") == 1 and isinstance(payload.get("entries"), dict):
+                self.entries = payload["entries"]
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+
+    def get(self, path: Path) -> MediaFile | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        entry = self.entries.get(str(path))
+        if (
+            not entry
+            or entry.get("size") != stat.st_size
+            or entry.get("modified_ns") != stat.st_mtime_ns
+        ):
+            return None
+        try:
+            return MediaFile(
+                path=path,
+                codec=str(entry["codec"]),
+                duration=float(entry["duration"]),
+                size=int(entry["size"]),
+                audio=[Track(**track) for track in entry.get("audio", [])],
+                subtitles=[Track(**track) for track in entry.get("subtitles", [])],
+                original_language=entry.get("original_language"),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def put(self, media: MediaFile) -> None:
+        stat = media.path.stat()
+        self.entries[str(media.path)] = {
+            "size": stat.st_size,
+            "modified_ns": stat.st_mtime_ns,
+            "codec": media.codec,
+            "duration": media.duration,
+            "original_language": media.original_language,
+            "audio": [vars(track) for track in media.audio],
+            "subtitles": [vars(track) for track in media.subtitles],
+        }
+
+    def save(self) -> None:
+        atomic_write_json(self.path, {"version": 1, "entries": self.entries}, force=True)
 
 
 def select_tracks(

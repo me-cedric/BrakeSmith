@@ -32,15 +32,15 @@ Checked items are implemented, reviewed, and committed. Each stage receives a pa
 
 ## v0.3.3 — Scalable inventory
 
-- [ ] Add configurable concurrent ffprobe workers with conservative SMB default
-- [ ] Add ffprobe timeouts
-- [ ] Add local persistent probe cache keyed by path, size, and modification time
-- [ ] Never place cache files on scanned shares by default
-- [ ] Report scan progress, failures, and cache hits
-- [ ] Save partial candidate reports when scanning is interrupted
-- [ ] Surface directory traversal and permission errors
-- [ ] Add include/exclude globs and size/codec/duration filters
-- [ ] Keep machine-readable stdout clean; route status and warnings to stderr
+- [x] Add configurable concurrent ffprobe workers with conservative SMB default
+- [x] Add ffprobe timeouts
+- [x] Add local persistent probe cache keyed by path, size, and modification time
+- [x] Never place cache files on scanned shares by default
+- [x] Report scan progress, failures, and cache hits
+- [x] Save partial candidate reports when scanning is interrupted
+- [x] Surface directory traversal and permission errors
+- [x] Add include/exclude globs and size/codec/duration filters
+- [x] Keep machine-readable stdout clean; route status and warnings to stderr
 
 ## v0.3.4 — Durable batch plans
 

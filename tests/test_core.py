@@ -6,6 +6,7 @@ import pytest
 from brakesmith.core import (
     BrakeSmithError,
     MediaFile,
+    ProbeCache,
     Track,
     atomic_write_json,
     discover,
@@ -150,3 +151,15 @@ def test_atomic_json_refuses_existing_report(tmp_path: Path):
     assert json.loads(report.read_text()) == {"status": "ok"}
     with pytest.raises(BrakeSmithError, match="Report exists"):
         atomic_write_json(report, {"status": "changed"})
+
+
+def test_probe_cache_invalidates_changed_source(tmp_path: Path):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"first")
+    cache_path = tmp_path / "cache.json"
+    cache = ProbeCache(cache_path)
+    cache.put(MediaFile(source, "h264", 10, source.stat().st_size))
+    cache.save()
+    assert ProbeCache(cache_path).get(source).codec == "h264"
+    source.write_bytes(b"changed-size")
+    assert ProbeCache(cache_path).get(source) is None

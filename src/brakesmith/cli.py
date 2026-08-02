@@ -6,6 +6,8 @@ import json
 import re
 import signal
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +21,8 @@ from . import __version__
 from .core import (
     BrakeSmithError,
     MediaFile,
+    ProbeCache,
+    ScanInterrupted,
     atomic_write_json,
     discover,
     ensure_source_unchanged,
@@ -39,6 +43,7 @@ app = typer.Typer(
     help="Forge a safe, reviewed batch of H.265 files with HandBrakeCLI.", no_args_is_help=True
 )
 console = Console()
+error_console = Console(stderr=True)
 
 
 def version_callback(value: bool) -> None:
@@ -57,21 +62,89 @@ def main(
 
 
 def inspect(
-    root: Path, depth: int, ffprobe_path: Optional[Path], extensions: str = ""
+    root: Path,
+    depth: int,
+    ffprobe_path: Optional[Path],
+    extensions: str = "",
+    workers: int = 2,
+    probe_timeout: float = 60,
+    cache_path: Optional[Path] = None,
+    use_cache: bool = True,
 ) -> list[MediaFile]:
     ffprobe = find_executable("ffprobe", ffprobe_path)
     if not ffprobe:
         raise BrakeSmithError("ffprobe not found. Install FFmpeg or pass --ffprobe.")
     limit = None if depth < 0 else depth
-    paths = discover(root, limit, extensions.split(",") if extensions else ())
-    media = []
-    with console.status(f"Inspecting {len(paths)} video files…"):
-        for path in paths:
+    traversal_errors: list[str] = []
+    paths = discover(
+        root, limit, extensions.split(",") if extensions else (), errors=traversal_errors
+    )
+    media: list[MediaFile] = []
+    errors = list(traversal_errors)
+    cache = ProbeCache(cache_path) if use_cache else None
+    pending: list[Path] = []
+    cache_hits = 0
+    for path in paths:
+        cached = cache.get(path) if cache else None
+        if cached:
+            media.append(cached)
+            cache_hits += 1
+        else:
+            pending.append(path)
+
+    progress = Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=error_console,
+        transient=True,
+    )
+    executor = ThreadPoolExecutor(
+        max_workers=max(1, workers), thread_name_prefix="brakesmith-probe"
+    )
+    futures = {executor.submit(probe, path, ffprobe, probe_timeout): path for path in pending}
+    try:
+        with progress:
+            task = progress.add_task(
+                f"Inspecting {len(paths)} files ({cache_hits} cached)",
+                total=len(paths),
+                completed=cache_hits,
+            )
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    item = future.result()
+                    media.append(item)
+                    if cache:
+                        cache.put(item)
+                except BrakeSmithError as error:
+                    errors.append(str(error))
+                progress.advance(task)
+    except KeyboardInterrupt:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        if cache:
             try:
-                media.append(probe(path, ffprobe))
+                cache.save()
             except BrakeSmithError as error:
-                console.print(f"[yellow]Warning:[/] {error}")
-    return media
+                errors.append(str(error))
+        raise ScanInterrupted(sorted(media, key=lambda item: str(item.path).lower()), errors)
+    else:
+        executor.shutdown(wait=True)
+    if cache:
+        try:
+            cache.save()
+        except BrakeSmithError as error:
+            errors.append(str(error))
+    for error in errors:
+        error_console.print(f"[yellow]Warning:[/] {error}")
+    error_console.print(
+        f"[dim]Inspected {len(media)}/{len(paths)} files; {cache_hits} cache hits; "
+        f"{len(errors)} warning(s).[/]"
+    )
+    return sorted(media, key=lambda item: str(item.path).lower())
 
 
 def render(media: list[MediaFile], root: Path) -> None:
@@ -113,6 +186,37 @@ def media_payload(item: MediaFile) -> dict[str, object]:
     }
 
 
+def write_candidates_report(items: list[MediaFile], output: Path, force: bool = False) -> None:
+    output = output.expanduser().resolve()
+    if output.exists() and not force:
+        raise BrakeSmithError(f"Report exists: {output}; pass --force to replace it")
+    suffix = output.suffix.lower()
+    if suffix == ".json":
+        content = json.dumps([media_payload(item) for item in items], indent=2) + "\n"
+    elif suffix == ".csv":
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(["path", "codec", "duration_seconds", "size_bytes", "audio", "subtitles"])
+        for item in items:
+            writer.writerow(
+                [
+                    item.path,
+                    item.codec,
+                    item.duration,
+                    item.size,
+                    ",".join(track.language for track in item.audio),
+                    ",".join(track.language for track in item.subtitles),
+                ]
+            )
+        content = stream.getvalue()
+    elif suffix == ".txt":
+        content = "".join(f"{item.path}\n" for item in items)
+    else:
+        raise BrakeSmithError("Report extension must be .json, .csv, or .txt")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(content, encoding="utf-8")
+
+
 @app.command()
 def scan(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
@@ -121,17 +225,26 @@ def scan(
     ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
     extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
+    workers: int = typer.Option(2, min=1, max=32, help="Concurrent metadata probes."),
+    probe_timeout: float = typer.Option(60, min=1, help="Seconds allowed per metadata probe."),
+    cache: Optional[Path] = typer.Option(None, "--cache-file", help="Local probe-cache path."),
+    use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use local probe cache."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
 ) -> None:
     """List every supported video and whether it should be converted."""
     try:
-        items = inspect(directory, depth, ffprobe, extensions)
+        items = inspect(
+            directory, depth, ffprobe, extensions, workers, probe_timeout, cache, use_cache
+        )
+    except ScanInterrupted as error:
+        error_console.print(f"[yellow]{error}[/]")
+        raise typer.Exit(130)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
     if json_output:
         payload = [media_payload(item) for item in items]
-        console.print_json(json.dumps(payload))
+        typer.echo(json.dumps(payload, indent=2))
     else:
         render(items, directory)
 
@@ -143,47 +256,65 @@ def candidates(
     output: Optional[Path] = typer.Option(None, help="Write complete .json, .csv, or .txt list."),
     force: bool = typer.Option(False, help="Replace an existing report, never media."),
     extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
+    workers: int = typer.Option(2, min=1, max=32, help="Concurrent metadata probes."),
+    probe_timeout: float = typer.Option(60, min=1, help="Seconds allowed per metadata probe."),
+    cache: Optional[Path] = typer.Option(None, "--cache-file", help="Local probe-cache path."),
+    use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use local probe cache."),
+    include: str = typer.Option("", help="Comma-separated relative-path globs to include."),
+    exclude: str = typer.Option("", help="Comma-separated relative-path globs to exclude."),
+    min_size: int = typer.Option(0, min=0, help="Minimum source bytes."),
+    max_size: int = typer.Option(0, min=0, help="Maximum source bytes; 0 disables."),
+    min_duration: float = typer.Option(0, min=0, help="Minimum duration in seconds."),
+    max_duration: float = typer.Option(0, min=0, help="Maximum duration; 0 disables."),
+    codecs: str = typer.Option("", help="Comma-separated source codecs to include."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
 ) -> None:
     """List only files whose video codec is not already HEVC."""
     try:
+        items = inspect(
+            directory, depth, ffprobe, extensions, workers, probe_timeout, cache, use_cache
+        )
+        include_patterns = [value for value in include.split(",") if value]
+        exclude_patterns = [value for value in exclude.split(",") if value]
+        wanted_codecs = {value.strip().lower() for value in codecs.split(",") if value.strip()}
         items = [
-            item for item in inspect(directory, depth, ffprobe, extensions) if item.should_convert
+            item
+            for item in items
+            if item.should_convert
+            and (
+                not include_patterns
+                or any(
+                    fnmatch(str(item.path.relative_to(directory)), pattern)
+                    for pattern in include_patterns
+                )
+            )
+            and not any(
+                fnmatch(str(item.path.relative_to(directory)), pattern)
+                for pattern in exclude_patterns
+            )
+            and item.size >= min_size
+            and (not max_size or item.size <= max_size)
+            and item.duration >= min_duration
+            and (not max_duration or item.duration <= max_duration)
+            and (not wanted_codecs or item.codec.lower() in wanted_codecs)
         ]
         if output:
-            output = output.expanduser().resolve()
-            if output.exists() and not force:
-                raise BrakeSmithError(f"Report exists: {output}; pass --force to replace it")
-            suffix = output.suffix.lower()
-            if suffix == ".json":
-                content = json.dumps([media_payload(item) for item in items], indent=2) + "\n"
-            elif suffix == ".csv":
-                stream = io.StringIO()
-                writer = csv.writer(stream)
-                writer.writerow(
-                    ["path", "codec", "duration_seconds", "size_bytes", "audio", "subtitles"]
-                )
-                for item in items:
-                    writer.writerow(
-                        [
-                            item.path,
-                            item.codec,
-                            item.duration,
-                            item.size,
-                            ",".join(track.language for track in item.audio),
-                            ",".join(track.language for track in item.subtitles),
-                        ]
-                    )
-                content = stream.getvalue()
-            elif suffix == ".txt":
-                content = "".join(f"{item.path}\n" for item in items)
-            else:
-                raise BrakeSmithError("Report extension must be .json, .csv, or .txt")
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(content, encoding="utf-8")
+            write_candidates_report(items, output, force)
             console.print(f"[green]Saved:[/] {len(items)} conversion candidate(s) to {output}")
         else:
             render(items, directory)
+    except ScanInterrupted as error:
+        if output:
+            partial = output.with_name(f"{output.stem}.partial{output.suffix}")
+            try:
+                write_candidates_report(
+                    [item for item in error.items if item.should_convert], partial, force=True
+                )
+                error_console.print(f"[yellow]Partial report saved:[/] {partial.resolve()}")
+            except BrakeSmithError as report_error:
+                error_console.print(f"[red]Partial report failed:[/] {report_error}")
+        error_console.print(f"[yellow]{error}[/]")
+        raise typer.Exit(130)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
@@ -327,6 +458,10 @@ def run_batch(
     summary: Optional[Path] = typer.Option(None, help="Write atomic JSON batch summary."),
     force_summary: bool = typer.Option(False, help="Replace only an existing summary report."),
     extensions: str = typer.Option("", help="Extra comma-separated file extensions to inspect."),
+    workers: int = typer.Option(2, min=1, max=32, help="Concurrent metadata probes."),
+    probe_timeout: float = typer.Option(60, min=1, help="Seconds allowed per metadata probe."),
+    cache: Optional[Path] = typer.Option(None, "--cache-file", help="Local probe-cache path."),
+    use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use local probe cache."),
     yes: bool = typer.Option(
         False, "--yes", "-y", help="Skip final confirmation; unresolved originals still fail."
     ),
@@ -348,7 +483,16 @@ def run_batch(
     try:
         items = [
             m
-            for m in inspect(directory, depth, ffprobe, extensions)
+            for m in inspect(
+                directory,
+                depth,
+                ffprobe,
+                extensions,
+                workers,
+                probe_timeout,
+                cache,
+                use_cache,
+            )
             if m.should_convert or include_hevc
         ]
         render(items, directory)
