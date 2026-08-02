@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -5,12 +6,19 @@ import pytest
 from brakesmith.core import (
     BrakeSmithError,
     MediaFile,
+    ProbeCache,
     Track,
+    atomic_write_json,
     discover,
+    ensure_source_unchanged,
     handbrake_command,
     normalize_languages,
     output_path,
+    quarantine_file,
     select_tracks,
+    snapshot_source,
+    validate_destinations,
+    validate_output,
 )
 
 
@@ -97,3 +105,99 @@ def test_command_can_keep_reconciled_unknown_tracks(tmp_path: Path):
     )
     assert command[command.index("--audio") + 1] == "1"
     assert command[command.index("--subtitle") + 1] == "1"
+
+
+def test_source_snapshot_detects_change(tmp_path: Path):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"before")
+    snapshot = snapshot_source(source)
+    source.write_bytes(b"after-change")
+    with pytest.raises(BrakeSmithError, match="Source changed"):
+        ensure_source_unchanged(snapshot)
+
+
+def test_destination_collision_is_rejected(tmp_path: Path):
+    destination = tmp_path / "movie.brakesmith.mkv"
+    with pytest.raises(BrakeSmithError, match="Output collision"):
+        validate_destinations(
+            [(tmp_path / "movie.mp4", destination), (tmp_path / "movie.avi", destination)]
+        )
+
+
+def test_validate_output_checks_tracks(tmp_path: Path, monkeypatch):
+    output = tmp_path / "movie.part"
+    output.write_bytes(b"x" * 2048)
+    monkeypatch.setattr(
+        "brakesmith.core.probe",
+        lambda *args: MediaFile(output, "hevc", 100, 2048, [Track(1, 1, "audio", "eng")]),
+    )
+    assert validate_output(output, "ffprobe", 100, 1, 0).codec == "hevc"
+    with pytest.raises(BrakeSmithError, match="audio tracks"):
+        validate_output(output, "ffprobe", 100, 2, 0)
+
+
+def test_quarantine_never_overwrites(tmp_path: Path):
+    partial = tmp_path / "movie.part"
+    partial.write_text("first")
+    (tmp_path / "movie.part.invalid").write_text("existing")
+    quarantined = quarantine_file(partial)
+    assert quarantined.name == "movie.part.invalid.1"
+    assert quarantined.read_text() == "first"
+
+
+def test_atomic_json_refuses_existing_report(tmp_path: Path):
+    report = tmp_path / "summary.json"
+    atomic_write_json(report, {"status": "ok"})
+    assert json.loads(report.read_text()) == {"status": "ok"}
+    with pytest.raises(BrakeSmithError, match="Report exists"):
+        atomic_write_json(report, {"status": "changed"})
+
+
+def test_probe_cache_invalidates_changed_source(tmp_path: Path):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"first")
+    cache_path = tmp_path / "cache.json"
+    cache = ProbeCache(cache_path)
+    cache.put(MediaFile(source, "h264", 10, source.stat().st_size))
+    cache.save()
+    assert ProbeCache(cache_path).get(source).codec == "h264"
+    source.write_bytes(b"changed-size")
+    assert ProbeCache(cache_path).get(source) is None
+
+
+def test_track_flags_and_title_filters():
+    tracks = [
+        Track(1, 1, "audio", "eng", title="Main"),
+        Track(2, 2, "audio", "eng", title="Director Commentary", commentary=True),
+        Track(3, 3, "audio", "fra", title="Description", visual_impaired=True),
+    ]
+    assert select_tracks(
+        tracks,
+        ["eng", "fra"],
+        keep_commentary=False,
+        exclude_titles=["description"],
+    ) == [1]
+
+
+def test_encoder_controls_are_explicit(tmp_path: Path):
+    media = MediaFile(tmp_path / "source.mkv", "h264", 10, 1)
+    command = handbrake_command(
+        "HandBrakeCLI",
+        media,
+        tmp_path / "output.part",
+        [],
+        [],
+        None,
+        18,
+        "slow",
+        bit_depth=12,
+        tune="grain",
+        crop="none",
+        deinterlace="yadif",
+        lossless=True,
+    )
+    assert "x265_12bit" in command
+    assert "grain" in command
+    assert "0:0:0:0" in command
+    assert "--yadif" in command
+    assert "lossless=1" in command
