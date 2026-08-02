@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,7 @@ from .core import (
     MediaFile,
     ProbeCache,
     ScanInterrupted,
+    SourceSnapshot,
     atomic_write_json,
     discover,
     ensure_source_unchanged,
@@ -38,6 +40,7 @@ from .core import (
     validate_destinations,
     validate_output,
 )
+from .plans import load_plan, load_state, write_plan, write_state
 
 app = typer.Typer(
     help="Forge a safe, reviewed batch of H.265 files with HandBrakeCLI.", no_args_is_help=True
@@ -389,6 +392,327 @@ def reconcile_unknown_tracks(
                 ):
                     result[item.path].add(track.type_index)
     return result
+
+
+@app.command(name="plan")
+def plan_batch(
+    directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
+    output: Path = typer.Option(..., help="Destination .json plan."),
+    depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
+    audio: str = typer.Option("fra,eng", help="Audio languages to keep."),
+    subtitles: str = typer.Option("fra,eng", help="Subtitle languages to keep."),
+    unknown_audio: str = typer.Option("ask", help="Unlabelled audio: ask, keep, or drop."),
+    unknown_subtitles: str = typer.Option("ask", help="Unlabelled subtitles: ask, keep, or drop."),
+    keep_original: bool = typer.Option(True, "--keep-original/--no-keep-original"),
+    original_language: Optional[str] = typer.Option(None),
+    quality: float = typer.Option(18.0, min=0, max=51),
+    preset: str = typer.Option("slow"),
+    output_directory: Optional[Path] = typer.Option(None),
+    allow_no_audio: bool = typer.Option(False),
+    extensions: str = typer.Option(""),
+    workers: int = typer.Option(2, min=1, max=32),
+    probe_timeout: float = typer.Option(60, min=1),
+    cache: Optional[Path] = typer.Option(None, "--cache-file"),
+    use_cache: bool = typer.Option(True, "--cache/--no-cache"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    force: bool = typer.Option(False, help="Replace only an existing plan."),
+    handbrake: Optional[Path] = typer.Option(None),
+    ffprobe: Optional[Path] = typer.Option(None),
+) -> None:
+    """Create a reviewed, immutable batch plan without encoding."""
+    executable = find_executable("HandBrakeCLI", handbrake)
+    ffprobe_executable = find_executable("ffprobe", ffprobe)
+    if not executable or not ffprobe_executable:
+        console.print("[red]Error:[/] HandBrakeCLI or ffprobe not found. Run `brakesmith doctor`.")
+        raise typer.Exit(2)
+    try:
+        items = [
+            item
+            for item in inspect(
+                directory,
+                depth,
+                ffprobe,
+                extensions,
+                workers,
+                probe_timeout,
+                cache,
+                use_cache,
+            )
+            if item.should_convert
+        ]
+        if not items:
+            console.print("No conversion candidates.")
+            return
+        originals = reconcile_original(items, keep_original, original_language, yes)
+        extra_audio = reconcile_unknown_tracks(items, "audio", unknown_audio, yes)
+        extra_subtitles = reconcile_unknown_tracks(items, "subtitles", unknown_subtitles, yes)
+        audio_languages = normalize_languages(audio.split(","))
+        subtitle_languages = normalize_languages(subtitles.split(","))
+        plan_items: list[dict[str, object]] = []
+        destinations: list[tuple[Path, Path]] = []
+        for item in items:
+            selected_audio = sorted(
+                set(select_tracks(item.audio, audio_languages, originals[item.path]))
+                | extra_audio[item.path]
+            )
+            selected_subtitles = sorted(
+                set(select_tracks(item.subtitles, subtitle_languages)) | extra_subtitles[item.path]
+            )
+            if item.audio and not selected_audio and not allow_no_audio:
+                raise BrakeSmithError(f"No audio selected for {item.path}; adjust policy")
+            destination = output_path(item.path, output_directory, directory)
+            destinations.append((item.path, destination))
+            partial = destination.with_name(destination.name + ".part")
+            snapshot = snapshot_source(item.path)
+            plan_items.append(
+                {
+                    "source": str(item.path),
+                    "destination": str(destination),
+                    "partial": str(partial),
+                    "snapshot": {
+                        "path": str(snapshot.path),
+                        "size": snapshot.size,
+                        "modified_ns": snapshot.modified_ns,
+                        "device": snapshot.device,
+                        "inode": snapshot.inode,
+                    },
+                    "duration": item.duration,
+                    "audio_tracks": selected_audio,
+                    "subtitle_tracks": selected_subtitles,
+                    "command": handbrake_command(
+                        executable,
+                        item,
+                        partial,
+                        audio_languages,
+                        subtitle_languages,
+                        originals[item.path],
+                        quality,
+                        preset,
+                        extra_audio[item.path],
+                        extra_subtitles[item.path],
+                    ),
+                }
+            )
+        validate_destinations(destinations)
+        payload = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "root": str(directory),
+            "ffprobe": ffprobe_executable,
+            "settings": {
+                "quality": quality,
+                "preset": preset,
+                "audio_languages": audio_languages,
+                "subtitle_languages": subtitle_languages,
+            },
+            "totals": {
+                "files": len(plan_items),
+                "source_bytes": sum(item.size for item in items),
+                "minimum_free_bytes": sum(item.size for item in items),
+                "duration_seconds": sum(item.duration for item in items),
+            },
+            "items": plan_items,
+        }
+        write_plan(output, payload, force)
+        console.print(
+            f"[green]Plan:[/] {output.resolve()} · {len(plan_items)} file(s) · "
+            f"{sum(item.duration for item in items) / 3600:.1f} hours"
+        )
+    except ScanInterrupted as error:
+        error_console.print(f"[yellow]{error}[/]")
+        raise typer.Exit(130)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+
+
+app.command(name="dry-run", help="Alias for plan; writes a non-destructive reviewed plan.")(
+    plan_batch
+)
+
+
+@app.command(name="execute")
+def execute_plan(
+    plan_file: Path = typer.Argument(..., exists=True, dir_okay=False, resolve_path=True),
+    state_file: Optional[Path] = typer.Option(None, help="Atomic state journal path."),
+    retry_failed: bool = typer.Option(False, help="Process only previously failed items."),
+    stop_after_current: bool = typer.Option(False, help="Stop cleanly after one attempted file."),
+    max_failures: int = typer.Option(
+        1, min=0, help="Stop after this many failures; 0 is unlimited."
+    ),
+) -> None:
+    """Execute an immutable plan with durable resume state."""
+    try:
+        plan = load_plan(plan_file)
+        plan_digest = str(plan["digest"])
+        journal_path = state_file or plan_file.with_name(f"{plan_file.stem}.state.json")
+        state = load_state(journal_path, plan_digest)
+        statuses = state["items"]
+        assert isinstance(statuses, dict)
+        items = plan["items"]
+        assert isinstance(items, list)
+        ffprobe_executable = str(plan["ffprobe"])
+        if not Path(ffprobe_executable).is_file():
+            raise BrakeSmithError(f"Planned ffprobe is unavailable: {ffprobe_executable}")
+        durations = [float(item["duration"]) for item in items]
+        weights = [duration or 1.0 for duration in durations]
+        total_duration = sum(weights)
+        completed_weight = 0.0
+        failures = 0
+        attempted = 0
+        progress_pattern = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def request_cancel(signum: int, frame: object) -> None:
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, request_cancel)
+        try:
+            with Progress(
+                TextColumn("{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                total_task = progress.add_task("Planned duration", total=total_duration)
+                for item, duration, weight in zip(items, durations, weights):
+                    source = Path(str(item["source"]))
+                    destination = Path(str(item["destination"]))
+                    partial = Path(str(item["partial"]))
+                    previous = statuses.get(str(source), {})
+                    previous_status = previous.get("status") if isinstance(previous, dict) else None
+                    if retry_failed and previous_status != "failed":
+                        completed_weight += weight
+                        progress.update(total_task, completed=completed_weight)
+                        continue
+                    if not retry_failed and previous_status == "completed":
+                        completed_weight += weight
+                        progress.update(total_task, completed=completed_weight)
+                        continue
+                    attempted += 1
+                    file_task = progress.add_task(source.name, total=100)
+                    diagnostics: list[str] = []
+                    process: Optional[subprocess.Popen[str]] = None
+                    try:
+                        raw_snapshot = item["snapshot"]
+                        assert isinstance(raw_snapshot, dict)
+                        snapshot = SourceSnapshot(
+                            path=Path(str(raw_snapshot["path"])),
+                            size=int(raw_snapshot["size"]),
+                            modified_ns=int(raw_snapshot["modified_ns"]),
+                            device=int(raw_snapshot["device"]),
+                            inode=int(raw_snapshot["inode"]),
+                        )
+                        ensure_source_unchanged(snapshot)
+                        expected_audio = len(item["audio_tracks"])
+                        expected_subtitles = len(item["subtitle_tracks"])
+                        if destination.exists():
+                            validate_output(
+                                destination,
+                                ffprobe_executable,
+                                duration,
+                                expected_audio,
+                                expected_subtitles,
+                            )
+                            statuses[str(source)] = {
+                                "status": "completed",
+                                "output": str(destination),
+                                "recovered": True,
+                            }
+                        else:
+                            if partial.exists():
+                                raise BrakeSmithError(
+                                    f"Stale partial blocks planned execution: {partial}"
+                                )
+                            preflight_destination(destination, snapshot.size)
+                            command = item["command"]
+                            if not isinstance(command, list) or not all(
+                                isinstance(value, str) for value in command
+                            ):
+                                raise BrakeSmithError(f"Invalid planned command for {source}")
+                            process = subprocess.Popen(
+                                command,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                errors="replace",
+                            )
+                            assert process.stdout is not None
+                            for line in process.stdout:
+                                diagnostics.append(line)
+                                match = progress_pattern.search(line)
+                                if match:
+                                    percent = min(float(match.group(1)), 100)
+                                    progress.update(file_task, completed=percent)
+                                    progress.update(
+                                        total_task,
+                                        completed=completed_weight + weight * percent / 100,
+                                    )
+                            if process.wait() != 0:
+                                raise BrakeSmithError(f"HandBrake failed for {source.name}")
+                            ensure_source_unchanged(snapshot)
+                            validate_output(
+                                partial,
+                                ffprobe_executable,
+                                duration,
+                                expected_audio,
+                                expected_subtitles,
+                            )
+                            partial.replace(destination)
+                            statuses[str(source)] = {
+                                "status": "completed",
+                                "output": str(destination),
+                            }
+                        progress.update(file_task, completed=100)
+                    except KeyboardInterrupt:
+                        terminate_process(process)
+                        cleanup_error = cleanup_partial(partial)
+                        statuses[str(source)] = {
+                            "status": "cancelled",
+                            "error": cleanup_error,
+                        }
+                        write_state(journal_path, state)
+                        console.print("\n[yellow]Cancelled.[/] State saved; source untouched.")
+                        raise typer.Exit(130)
+                    except Exception as error:  # noqa: BLE001 - durable state needs every failure
+                        terminate_process(process)
+                        quarantined: Optional[Path] = None
+                        if partial.exists():
+                            try:
+                                quarantined = quarantine_file(partial, "invalid")
+                            except BrakeSmithError:
+                                pass
+                        log_path: Optional[Path] = None
+                        if diagnostics:
+                            try:
+                                log_path = write_failure_log(destination, diagnostics)
+                            except OSError:
+                                pass
+                        failures += 1
+                        statuses[str(source)] = {
+                            "status": "failed",
+                            "error": str(error),
+                            "quarantined": str(quarantined) if quarantined else None,
+                            "log": str(log_path) if log_path else None,
+                        }
+                        console.print(f"[red]Failed:[/] {source}: {error}")
+                    finally:
+                        completed_weight += weight
+                        progress.update(total_task, completed=completed_weight)
+                        progress.remove_task(file_task)
+                        write_state(journal_path, state)
+                    if stop_after_current or (max_failures and failures >= max_failures):
+                        break
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        console.print(
+            f"[green]State:[/] {journal_path.resolve()} · {attempted} attempted · {failures} failed"
+        )
+        if failures:
+            raise typer.Exit(1)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
 
 
 def terminate_process(process: Optional[subprocess.Popen[str]]) -> None:

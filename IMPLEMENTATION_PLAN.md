@@ -44,17 +44,17 @@ Checked items are implemented, reviewed, and committed. Each stage receives a pa
 
 ## v0.3.4 — Durable batch plans
 
-- [ ] Add non-destructive `plan`/`--dry-run` workflow
-- [ ] Save exact source identity, selections, destination, and encoder settings
-- [ ] Reject changed or edited plans unless explicitly regenerated
-- [ ] Execute saved plans without rescanning unrelated files
-- [ ] Persist completed, skipped, and failed state atomically
-- [ ] Resume interrupted batches
-- [ ] Retry failed files only
-- [ ] Stop after current file
-- [ ] Stop after configurable failure count
-- [ ] Weight total progress by media duration
-- [ ] Estimate source bytes, duration, free-space need, and rough completion scope
+- [x] Add non-destructive `plan`/`--dry-run` workflow
+- [x] Save exact source identity, selections, destination, and encoder settings
+- [x] Reject changed or edited plans unless explicitly regenerated
+- [x] Execute saved plans without rescanning unrelated files
+- [x] Persist completed, skipped, and failed state atomically
+- [x] Resume interrupted batches
+- [x] Retry failed files only
+- [x] Stop after current file
+- [x] Stop after configurable failure count
+- [x] Weight total progress by media duration
+- [x] Estimate source bytes, duration, free-space need, and rough completion scope
 
 ## v0.3.5 — Fidelity and track policy
 
