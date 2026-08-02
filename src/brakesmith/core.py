@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -282,6 +282,7 @@ def discover(
     max_depth: int | None = None,
     extra_extensions: Iterable[str] = (),
     errors: list[str] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[Path]:
     root = root.expanduser().resolve()
     if not root.is_dir():
@@ -296,7 +297,9 @@ def discover(
         if errors is not None:
             errors.append(str(error))
 
-    for current, dirs, files in os.walk(root, onerror=record_error):
+    for directories, (current, dirs, files) in enumerate(
+        os.walk(root, onerror=record_error), start=1
+    ):
         relative = Path(current).relative_to(root)
         depth = len(relative.parts)
         if max_depth is not None and depth >= max_depth:
@@ -305,6 +308,8 @@ def discover(
             path = Path(current) / filename
             if path.suffix.lower() in extensions and not filename.endswith(".brakesmith.mkv"):
                 found.append(path)
+        if on_progress:
+            on_progress(directories, len(found))
     return sorted(found, key=lambda path: str(path).lower())
 
 

@@ -29,7 +29,7 @@ It is review-first. Output is written to a temporary file, atomically renamed on
 - H.265/x265 10-bit constant-quality encoding; conservative quality 18 and `slow` preset.
 - Audio passthrough when MKV supports the source codec, with AAC fallback.
 - Subtitle passthrough, chapters, and metadata-friendly MKV output.
-- Per-file and total progress with time remaining.
+- Live discovery, metadata-analysis, per-file, and total progress with timing.
 - Ctrl+C cancellation removes only incomplete output.
 - Existing output is skipped, making interrupted batches safe to resume.
 - Same-directory temporary output works on mounted SMB shares without cross-filesystem moves.

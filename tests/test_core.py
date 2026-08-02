@@ -43,6 +43,17 @@ def test_discover_accepts_custom_extension(tmp_path: Path):
     assert discover(tmp_path, extra_extensions=["video"]) == [unusual]
 
 
+def test_discover_reports_live_counts(tmp_path: Path):
+    (tmp_path / "show").mkdir()
+    (tmp_path / "movie.mkv").touch()
+    (tmp_path / "show" / "episode.mp4").touch()
+    updates = []
+
+    discover(tmp_path, on_progress=lambda directories, files: updates.append((directories, files)))
+
+    assert updates[-1] == (2, 2)
+
+
 def test_discover_rejects_file(tmp_path: Path):
     path = tmp_path / "video.mkv"
     path.touch()

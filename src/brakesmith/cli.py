@@ -15,7 +15,16 @@ from typing import Optional
 
 import typer
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -82,9 +91,34 @@ def inspect(
         raise BrakeSmithError("ffprobe not found. Install FFmpeg or pass --ffprobe.")
     limit = None if depth < 0 else depth
     traversal_errors: list[str] = []
-    paths = discover(
-        root, limit, extensions.split(",") if extensions else (), errors=traversal_errors
+    discovery = Progress(
+        SpinnerColumn(finished_text="[green]✓[/]"),
+        TextColumn("{task.description}"),
+        TimeElapsedColumn(),
+        console=error_console,
     )
+    with discovery:
+        discovery_task = discovery.add_task("Discovering videos", total=None)
+
+        def update_discovery(directories: int, files: int) -> None:
+            discovery.update(
+                discovery_task,
+                description=f"Discovering videos · {directories} folders · {files} found",
+            )
+
+        paths = discover(
+            root,
+            limit,
+            extensions.split(",") if extensions else (),
+            errors=traversal_errors,
+            on_progress=update_discovery,
+        )
+        discovery.update(
+            discovery_task,
+            description=f"Discovered {len(paths)} videos",
+            total=1,
+            completed=1,
+        )
     media: list[MediaFile] = []
     errors = list(traversal_errors)
     cache = ProbeCache(cache_path) if use_cache else None
@@ -102,9 +136,10 @@ def inspect(
         TextColumn("{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
         TimeRemainingColumn(),
         console=error_console,
-        transient=True,
     )
     executor = ThreadPoolExecutor(
         max_workers=max(1, workers), thread_name_prefix="brakesmith-probe"
@@ -113,7 +148,7 @@ def inspect(
     try:
         with progress:
             task = progress.add_task(
-                f"Inspecting {len(paths)} files ({cache_hits} cached)",
+                f"Analyzing metadata ({cache_hits} cached)",
                 total=len(paths),
                 completed=cache_hits,
             )
@@ -764,11 +799,14 @@ def execute_plan(
                 TextColumn("{task.description}"),
                 BarColumn(),
                 TaskProgressColumn(),
+                TimeElapsedColumn(),
                 TimeRemainingColumn(),
                 console=console,
             ) as progress:
                 total_task = progress.add_task("Planned duration", total=total_duration)
-                for item, duration, weight in zip(items, durations, weights):
+                for file_number, (item, duration, weight) in enumerate(
+                    zip(items, durations, weights), start=1
+                ):
                     source = Path(str(item["source"]))
                     destination = Path(str(item["destination"]))
                     partial = Path(str(item["partial"]))
@@ -783,7 +821,9 @@ def execute_plan(
                         progress.update(total_task, completed=completed_weight)
                         continue
                     attempted += 1
-                    file_task = progress.add_task(source.name, total=100)
+                    file_task = progress.add_task(
+                        f"[{file_number}/{len(items)}] {source.name}", total=100
+                    )
                     diagnostics: list[str] = []
                     process: Optional[subprocess.Popen[str]] = None
                     try:
@@ -1155,11 +1195,13 @@ def run_batch(
             TextColumn("{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            total_task = progress.add_task("Total", total=len(items))
-            for item in items:
+            total_task = progress.add_task("Transcoding files", total=len(items))
+            for file_number, item in enumerate(items, start=1):
                 destination = destinations[item.path]
                 ensure_source_unchanged(snapshots[item.path])
                 partial = destination.with_name(destination.name + ".part")
@@ -1197,10 +1239,10 @@ def run_batch(
                                     "error": str(error),
                                 }
                             )
-                            progress.advance(total_task)
+                            progress.update(total_task, completed=file_number)
                             continue
                     if destination.exists():
-                        progress.advance(total_task)
+                        progress.update(total_task, completed=file_number)
                         continue
                 if partial.exists():
                     try:
@@ -1227,7 +1269,7 @@ def run_batch(
                                 "error": message,
                             }
                         )
-                        progress.advance(total_task)
+                        progress.update(total_task, completed=file_number)
                         continue
                     if stale_partial == "quarantine":
                         quarantined = quarantine_file(partial, f"stale-{classification}")
@@ -1237,7 +1279,9 @@ def run_batch(
                         if cleanup_error:
                             raise BrakeSmithError(cleanup_error)
                         console.print(f"[yellow]Deleted stale partial:[/] {partial}")
-                file_task = progress.add_task(item.path.name, total=100)
+                file_task = progress.add_task(
+                    f"[{file_number}/{len(items)}] {item.path.name}", total=100
+                )
                 command = handbrake_command(
                     executable,
                     item,
@@ -1274,7 +1318,12 @@ def run_batch(
                         diagnostics.append(line)
                         match = progress_pattern.search(line)
                         if match:
-                            progress.update(file_task, completed=min(float(match.group(1)), 100))
+                            percent = min(float(match.group(1)), 100)
+                            progress.update(file_task, completed=percent)
+                            progress.update(
+                                total_task,
+                                completed=(file_number - 1) + percent / 100,
+                            )
                     if process.wait() != 0:
                         raise BrakeSmithError(f"HandBrake failed for {item.path.name}")
                     ensure_source_unchanged(snapshots[item.path])
@@ -1351,7 +1400,7 @@ def run_batch(
                         console.print(f"[red]Warning:[/] {cleanup_error}")
                 finally:
                     progress.remove_task(file_task)
-                    progress.advance(total_task)
+                    progress.update(total_task, completed=file_number)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
     console.print(
