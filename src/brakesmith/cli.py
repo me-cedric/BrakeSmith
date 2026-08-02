@@ -492,6 +492,59 @@ def language_name(code: str) -> str:
     return str(language.name) if language else code.upper()
 
 
+def reconcile_quality_profile(
+    quality: float, preset: str, non_interactive: bool
+) -> tuple[float, str]:
+    if non_interactive:
+        return quality, preset
+    profiles = {
+        "highest": (16.0, "slow"),
+        "high": (18.0, "slow"),
+        "balanced": (20.0, "medium"),
+        "compact": (22.0, "medium"),
+        "custom": (quality, preset),
+    }
+    answer = questionary.select(
+        "Choose quality profile",
+        choices=[
+            Choice("Highest practical quality — RF 16, slow", value="highest"),
+            Choice("High quality — RF 18, slow", value="high"),
+            Choice("Balanced — RF 20, medium", value="balanced"),
+            Choice("Compact — RF 22, medium", value="compact"),
+            Choice(f"Current CLI settings — RF {quality:g}, {preset}", value="custom"),
+        ],
+        default="highest",
+        instruction="(↑/↓ move, enter confirm)",
+    ).ask()
+    if answer is None:
+        raise BrakeSmithError("Quality selection cancelled")
+    return profiles[answer]
+
+
+def reconcile_max_files(configured: Optional[int], non_interactive: bool) -> Optional[int]:
+    if configured is not None or non_interactive:
+        return configured
+
+    def validate(value: str) -> bool | str:
+        return value.isdigit() and int(value) > 0 or "Enter a whole number greater than zero"
+
+    answer = questionary.text(
+        "Maximum files to propose for transcoding",
+        default="1",
+        validate=validate,
+    ).ask()
+    if answer is None:
+        raise BrakeSmithError("Maximum file selection cancelled")
+    return int(answer)
+
+
+def limit_proposed_files(items: list[MediaFile], maximum: Optional[int]) -> list[MediaFile]:
+    if maximum is None or len(items) <= maximum:
+        return items
+    console.print(f"Proposing first {maximum} of {len(items)} conversion candidate(s).")
+    return items[:maximum]
+
+
 def reconcile_languages(
     items: list[MediaFile],
     configured_audio: str,
@@ -590,6 +643,9 @@ def plan_batch(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
     output: Path = typer.Option(..., help="Destination .json plan."),
     depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
+    max_files: Optional[int] = typer.Option(
+        None, min=1, help="Maximum conversion candidates; interactive runs ask when omitted."
+    ),
     audio: str = typer.Option("eng,fra", help="Audio languages to keep."),
     subtitles: str = typer.Option("eng,fra", help="Subtitle languages to keep."),
     unknown_audio: str = typer.Option("ask", help="Unlabelled audio: ask, keep, or drop."),
@@ -614,7 +670,7 @@ def plan_batch(
     replace_source: bool = typer.Option(
         False,
         "--replace-source/--keep-source",
-        help="Delete each source immediately after its validated HEVC output is published.",
+        help="Replace each source only when its validated HEVC output is smaller.",
     ),
     overrides: Optional[Path] = typer.Option(
         None, exists=True, dir_okay=False, help="Per-source audio_tracks/subtitle_tracks JSON."
@@ -659,20 +715,29 @@ def plan_batch(
         console.print("[red]Error:[/] HandBrakeCLI or ffprobe not found. Run `brakesmith doctor`.")
         raise typer.Exit(2)
     try:
-        items = [
-            item
-            for item in inspect(
-                directory,
-                depth,
-                ffprobe,
-                extensions,
-                workers,
-                probe_timeout,
-                cache,
-                use_cache,
-            )
-            if item.should_convert
-        ]
+        quality, preset = reconcile_quality_profile(quality, preset, non_interactive)
+        max_files = reconcile_max_files(max_files, non_interactive)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    try:
+        items = limit_proposed_files(
+            [
+                item
+                for item in inspect(
+                    directory,
+                    depth,
+                    ffprobe,
+                    extensions,
+                    workers,
+                    probe_timeout,
+                    cache,
+                    use_cache,
+                )
+                if item.should_convert
+            ],
+            max_files,
+        )
         if not items:
             console.print("No conversion candidates.")
             return
@@ -842,7 +907,8 @@ def plan_batch(
         write_plan(output, payload, force)
         if replace_source:
             console.print(
-                "[bold red]Replace mode:[/] execution deletes each source after output validation."
+                "[bold red]Replace mode:[/] execution deletes a source only after its output "
+                "is validated and smaller."
             )
         console.print(
             f"[green]Plan:[/] {output.resolve()} · {len(plan_items)} file(s) · "
@@ -969,14 +1035,31 @@ def execute_plan(
                                 expected_subtitles,
                                 int(item.get("chapters", 0)),
                             )
-                            if replace_source:
+                            discarded_size = (
+                                discard_not_smaller(destination, snapshot.size)
+                                if replace_source
+                                else None
+                            )
+                            if replace_source and discarded_size is None:
                                 delete_replaced_source(source, destination)
                             statuses[str(source)] = {
                                 "status": "completed",
-                                "output": str(destination),
+                                "output": None if discarded_size is not None else str(destination),
                                 "recovered": True,
-                                "source_deleted": replace_source,
+                                "source_deleted": replace_source and discarded_size is None,
+                                "result": (
+                                    "kept-source-not-smaller"
+                                    if discarded_size is not None
+                                    else "published"
+                                ),
+                                "source_bytes": snapshot.size,
+                                "output_bytes": discarded_size,
                             }
+                            if discarded_size is not None:
+                                console.print(
+                                    f"[yellow]Kept source:[/] output was not smaller "
+                                    f"({discarded_size} >= {snapshot.size} bytes): {source}"
+                                )
                         else:
                             if partial.exists():
                                 ensure_source_unchanged(snapshot)
@@ -988,15 +1071,35 @@ def execute_plan(
                                     expected_subtitles,
                                     int(item.get("chapters", 0)),
                                 )
-                                partial.replace(destination)
-                                if replace_source:
-                                    delete_replaced_source(source, destination)
+                                discarded_size = (
+                                    discard_not_smaller(partial, snapshot.size)
+                                    if replace_source
+                                    else None
+                                )
+                                if discarded_size is None:
+                                    partial.replace(destination)
+                                    if replace_source:
+                                        delete_replaced_source(source, destination)
                                 statuses[str(source)] = {
                                     "status": "completed",
-                                    "output": str(destination),
+                                    "output": (
+                                        None if discarded_size is not None else str(destination)
+                                    ),
                                     "recovered_partial": True,
-                                    "source_deleted": replace_source,
+                                    "source_deleted": replace_source and discarded_size is None,
+                                    "result": (
+                                        "kept-source-not-smaller"
+                                        if discarded_size is not None
+                                        else "published"
+                                    ),
+                                    "source_bytes": snapshot.size,
+                                    "output_bytes": discarded_size,
                                 }
+                                if discarded_size is not None:
+                                    console.print(
+                                        f"[yellow]Kept source:[/] output was not smaller "
+                                        f"({discarded_size} >= {snapshot.size} bytes): {source}"
+                                    )
                             else:
                                 preflight_destination(destination, snapshot.size)
                                 command = item["command"]
@@ -1033,14 +1136,34 @@ def execute_plan(
                                     expected_subtitles,
                                     int(item.get("chapters", 0)),
                                 )
-                                partial.replace(destination)
-                                if replace_source:
-                                    delete_replaced_source(source, destination)
+                                discarded_size = (
+                                    discard_not_smaller(partial, snapshot.size)
+                                    if replace_source
+                                    else None
+                                )
+                                if discarded_size is None:
+                                    partial.replace(destination)
+                                    if replace_source:
+                                        delete_replaced_source(source, destination)
                                 statuses[str(source)] = {
                                     "status": "completed",
-                                    "output": str(destination),
-                                    "source_deleted": replace_source,
+                                    "output": (
+                                        None if discarded_size is not None else str(destination)
+                                    ),
+                                    "source_deleted": replace_source and discarded_size is None,
+                                    "result": (
+                                        "kept-source-not-smaller"
+                                        if discarded_size is not None
+                                        else "published"
+                                    ),
+                                    "source_bytes": snapshot.size,
+                                    "output_bytes": discarded_size,
                                 }
+                                if discarded_size is not None:
+                                    console.print(
+                                        f"[yellow]Kept source:[/] output was not smaller "
+                                        f"({discarded_size} >= {snapshot.size} bytes): {source}"
+                                    )
                         progress.update(file_task, completed=100)
                     except KeyboardInterrupt:
                         terminate_process(process)
@@ -1114,6 +1237,16 @@ def cleanup_partial(path: Path) -> Optional[str]:
     return None
 
 
+def discard_not_smaller(output: Path, source_size: int) -> Optional[int]:
+    output_size = output.stat().st_size
+    if output_size < source_size:
+        return None
+    cleanup_error = cleanup_partial(output)
+    if cleanup_error:
+        raise BrakeSmithError(cleanup_error)
+    return output_size
+
+
 def delete_replaced_source(source: Path, destination: Path) -> None:
     try:
         source.unlink()
@@ -1137,6 +1270,9 @@ def write_failure_log(destination: Path, lines: list[str]) -> Path:
 def run_batch(
     directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
     depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
+    max_files: Optional[int] = typer.Option(
+        None, min=1, help="Maximum conversion candidates; interactive runs ask when omitted."
+    ),
     audio: str = typer.Option("eng,fra", help="Audio languages to keep (ISO codes or names)."),
     subtitles: str = typer.Option("eng,fra", help="Subtitle languages to keep."),
     unknown_audio: str = typer.Option("ask", help="Unlabelled audio tracks: ask, keep, or drop."),
@@ -1173,7 +1309,7 @@ def run_batch(
     replace_source: bool = typer.Option(
         False,
         "--replace-source/--keep-source",
-        help="Delete each source immediately after its validated HEVC output is published.",
+        help="Replace each source only when its validated HEVC output is smaller.",
     ),
     include_hevc: bool = typer.Option(False, help="Reprocess files already encoded as HEVC."),
     allow_no_audio: bool = typer.Option(
@@ -1232,20 +1368,29 @@ def run_batch(
         console.print("[red]Error:[/] --stale-partial must be fail, quarantine, or delete")
         raise typer.Exit(2)
     try:
-        items = [
-            m
-            for m in inspect(
-                directory,
-                depth,
-                ffprobe,
-                extensions,
-                workers,
-                probe_timeout,
-                cache,
-                use_cache,
-            )
-            if m.should_convert or include_hevc
-        ]
+        quality, preset = reconcile_quality_profile(quality, preset, non_interactive)
+        max_files = reconcile_max_files(max_files, non_interactive)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    try:
+        items = limit_proposed_files(
+            [
+                m
+                for m in inspect(
+                    directory,
+                    depth,
+                    ffprobe,
+                    extensions,
+                    workers,
+                    probe_timeout,
+                    cache,
+                    use_cache,
+                )
+                if m.should_convert or include_hevc
+            ],
+            max_files,
+        )
         if not items:
             return
         (
@@ -1332,7 +1477,7 @@ def run_batch(
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
     action = (
-        "Validated outputs will replace and permanently delete each source immediately"
+        "Only smaller validated outputs will replace and permanently delete their sources"
         if replace_source
         else "Originals will remain untouched"
     )
@@ -1404,7 +1549,11 @@ def run_batch(
                     else:
                         if replace_source:
                             try:
-                                delete_replaced_source(item.path, destination)
+                                discarded_size = discard_not_smaller(
+                                    destination, snapshots[item.path].size
+                                )
+                                if discarded_size is None:
+                                    delete_replaced_source(item.path, destination)
                             except BrakeSmithError as error:
                                 failures += 1
                                 console.print(f"[red]Failed:[/] {error}")
@@ -1417,16 +1566,34 @@ def run_batch(
                                     }
                                 )
                             else:
-                                completed += 1
-                                console.print(f"[green]Replaced:[/] {item.path} → {destination}")
-                                summary_entries.append(
-                                    {
-                                        "source": str(item.path),
-                                        "output": str(destination),
-                                        "status": "completed-existing",
-                                        "source_deleted": True,
-                                    }
-                                )
+                                if discarded_size is not None:
+                                    skipped += 1
+                                    console.print(
+                                        f"[yellow]Kept source:[/] existing output was not smaller "
+                                        f"({discarded_size} >= {snapshots[item.path].size} bytes)"
+                                    )
+                                    summary_entries.append(
+                                        {
+                                            "source": str(item.path),
+                                            "output": None,
+                                            "status": "kept-source-not-smaller",
+                                            "source_bytes": snapshots[item.path].size,
+                                            "output_bytes": discarded_size,
+                                        }
+                                    )
+                                else:
+                                    completed += 1
+                                    console.print(
+                                        f"[green]Replaced:[/] {item.path} → {destination}"
+                                    )
+                                    summary_entries.append(
+                                        {
+                                            "source": str(item.path),
+                                            "output": str(destination),
+                                            "status": "completed-existing",
+                                            "source_deleted": True,
+                                        }
+                                    )
                         else:
                             console.print(f"[yellow]Skip:[/] Valid output exists: {destination}")
                             skipped += 1
@@ -1530,6 +1697,28 @@ def run_batch(
                         len(selected_subtitles[item.path]),
                         item.chapters,
                     )
+                    discarded_size = (
+                        discard_not_smaller(partial, snapshots[item.path].size)
+                        if replace_source
+                        else None
+                    )
+                    if discarded_size is not None:
+                        skipped += 1
+                        console.print(
+                            f"[yellow]Kept source:[/] output was not smaller "
+                            f"({discarded_size} >= {snapshots[item.path].size} bytes): {item.path}"
+                        )
+                        summary_entries.append(
+                            {
+                                "source": str(item.path),
+                                "output": None,
+                                "status": "kept-source-not-smaller",
+                                "source_bytes": snapshots[item.path].size,
+                                "output_bytes": discarded_size,
+                            }
+                        )
+                        progress.update(file_task, completed=100)
+                        continue
                     partial.replace(destination)
                     if replace_source:
                         delete_replaced_source(item.path, destination)
@@ -1602,7 +1791,11 @@ def run_batch(
                     progress.update(total_task, completed=file_number)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
-    source_result = "Completed sources deleted." if replace_source else "Originals untouched."
+    source_result = (
+        "Only smaller validated outputs replaced sources."
+        if replace_source
+        else "Originals untouched."
+    )
     console.print(
         f"[green]Done:[/] {completed} completed, {skipped} skipped, {failures} failed. "
         f"{source_result}"

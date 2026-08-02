@@ -59,6 +59,7 @@ It is review-first. Output is written to a temporary file and published only aft
 - Batch execution requires review and confirmation unless `--yes` is used.
 - `--non-interactive` controls prompts separately from `--yes` confirmation bypass.
 - Replace mode publishes and validates the new file before deleting its source. A deletion failure keeps both files and reports failure.
+- Replace mode compares exact byte sizes after validation. Equal/larger output is deleted and source is retained.
 
 ## Requirements
 
@@ -131,7 +132,7 @@ Review and convert:
 brakesmith run
 ```
 
-After scanning, one global picker lists full language names and audio/subtitle counts. Use arrow keys and Space, then press Enter. English and French start selected; detected extras start unchecked.
+Interactive runs first ask for a quality profile, defaulting to highest practical quality (RF 16, slow), then ask how many files to propose, defaulting to one. After scanning, one global picker lists full language names and audio/subtitle counts. Use arrow keys and Space, then press Enter. English and French start selected; detected extras start unchecked.
 
 Tdarr-style in-place library conversion:
 
@@ -139,7 +140,13 @@ Tdarr-style in-place library conversion:
 brakesmith run /smb --replace-source
 ```
 
-Each successful file becomes MKV/HEVC, unselected streams and image/data attachments are omitted, codec text in its name is normalized, then its old source is deleted before the next file starts.
+Each successful file becomes MKV/HEVC, unselected streams and image/data attachments are omitted, and codec text in its name is normalized. Smaller output replaces its source before the next file starts; equal/larger output is discarded.
+
+For unattended runs, prompts stay disabled and explicit settings apply:
+
+```sh
+brakesmith run /smb --replace-source --max-files 5 --quality 18 --preset slow --non-interactive --unknown-audio keep --unknown-subtitles drop --yes
+```
 
 Scan another directory:
 
@@ -315,7 +322,7 @@ Inspect and fix incorrect tags with a tool such as MKVToolNix before a large bat
 
 Default mode: `movie.mp4` becomes `movie.brakesmith.mkv`, source retained.
 
-Replace mode: `Movie.1080p.x264.mp4` becomes `Movie.1080p.x265.mkv`; `Movie.AVC.avi` becomes `Movie.HEVC.mkv`. With no codec token, `.x265` is appended. Validated existing outputs resume source deletion safely.
+Replace mode: `Movie.1080p.x264.mp4` becomes `Movie.1080p.x265.mkv`; `Movie.AVC.avi` becomes `Movie.HEVC.mkv`. With no codec token, `.x265` is appended. Validated existing outputs resume safely. Equal/larger outputs are removed while originals remain.
 
 Existing outputs are skipped only after successful validation. Invalid files require an explicit `--invalid-existing quarantine` policy. Stale partial files default to failure and require an explicit policy.
 

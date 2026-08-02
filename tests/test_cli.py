@@ -21,6 +21,46 @@ def test_delete_replaced_source_keeps_validated_output(tmp_path: Path):
     assert destination.read_text() == "new"
 
 
+def test_discard_not_smaller_keeps_only_smaller_output(tmp_path: Path):
+    smaller = tmp_path / "smaller.mkv"
+    smaller.write_bytes(b"123")
+    assert cli.discard_not_smaller(smaller, 4) is None
+    assert smaller.exists()
+
+    equal = tmp_path / "equal.mkv"
+    equal.write_bytes(b"1234")
+    assert cli.discard_not_smaller(equal, 4) == 4
+    assert not equal.exists()
+
+
+def test_batch_setup_prompts_default_to_highest_quality_and_one_file(monkeypatch):
+    class Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    def select(*args, **kwargs):
+        assert kwargs["default"] == "highest"
+        assert kwargs["choices"][0].title.startswith("Highest practical quality")
+        return Answer("highest")
+
+    def text(*args, **kwargs):
+        assert kwargs["default"] == "1"
+        assert kwargs["validate"]("5") is True
+        assert isinstance(kwargs["validate"]("0"), str)
+        return Answer("1")
+
+    monkeypatch.setattr(cli.questionary, "select", select)
+    monkeypatch.setattr(cli.questionary, "text", text)
+
+    assert cli.reconcile_quality_profile(18, "slow", False) == (16, "slow")
+    assert cli.reconcile_max_files(None, False) == 1
+    assert cli.reconcile_quality_profile(21, "fast", True) == (21, "fast")
+    assert cli.reconcile_max_files(5, True) == 5
+
+
 def test_candidates_exports_only_non_hevc(tmp_path: Path, monkeypatch):
     source = tmp_path / "source.mp4"
     source.touch()
