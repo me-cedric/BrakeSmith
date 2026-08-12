@@ -417,7 +417,7 @@ def discover(
     return sorted(found, key=lambda path: str(path).lower())
 
 
-def probe(path: Path, ffprobe: str = "ffprobe", timeout: float = 60) -> MediaFile:
+def probe(path: Path, ffprobe: str = "ffprobe", timeout: float | None = 60) -> MediaFile:
     command = [
         ffprobe,
         "-v",

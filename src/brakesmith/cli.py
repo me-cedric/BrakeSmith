@@ -6,11 +6,13 @@ import json
 import re
 import signal
 import subprocess
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
+from hashlib import sha256
 from pathlib import Path
 from typing import Optional
 
@@ -62,11 +64,14 @@ from .core import (
     validate_destinations,
     validate_output,
 )
+from .failures import FAILURE_TYPES, FailureStore
 from .plans import load_plan, load_state, write_plan, write_state
 
 app = typer.Typer(
     help="Forge a safe, reviewed batch of H.265 files with HandBrakeCLI.", no_args_is_help=True
 )
+failures_app = typer.Typer(help="Manage files blocked after failed or unhelpful conversions.")
+app.add_typer(failures_app, name="failures")
 console = Console()
 error_console = Console(stderr=True)
 
@@ -95,6 +100,7 @@ def inspect(
     probe_timeout: float = 60,
     cache_path: Optional[Path] = None,
     use_cache: bool = True,
+    retry_blocked: bool = False,
 ) -> list[MediaFile]:
     ffprobe = find_executable("ffprobe", ffprobe_path)
     if not ffprobe:
@@ -132,13 +138,29 @@ def inspect(
     media: list[MediaFile] = []
     errors = list(traversal_errors)
     cache = ProbeCache(cache_path) if use_cache else None
+    outcome_store = FailureStore()
+    probe_policy = policy_digest({"ffprobe": ffprobe, "timeout": probe_timeout})
     pending: list[Path] = []
     cache_hits = 0
+    blocked_probes = 0
     for path in paths:
+        previous = outcome_store.active(path, probe_policy)
+        if (
+            not retry_blocked
+            and previous
+            and previous.get("type") == "probe"
+            and FailureStore.blocks(previous)
+        ):
+            blocked_probes += 1
+            continue
         cached = cache.get(path) if cache else None
         if cached:
             media.append(cached)
             cache_hits += 1
+            try:
+                outcome_store.resolve_probe(path)
+            except BrakeSmithError as registry_error:
+                errors.append(str(registry_error))
         else:
             pending.append(path)
 
@@ -169,8 +191,16 @@ def inspect(
                     media.append(item)
                     if cache:
                         cache.put(item)
+                    try:
+                        outcome_store.resolve_probe(path)
+                    except BrakeSmithError as registry_error:
+                        errors.append(str(registry_error))
                 except BrakeSmithError as error:
                     errors.append(str(error))
+                    try:
+                        outcome_store.record(path, "probe", str(error), policy_hash=probe_policy)
+                    except BrakeSmithError as registry_error:
+                        errors.append(str(registry_error))
                 progress.advance(task)
     except KeyboardInterrupt:
         for future in futures:
@@ -193,12 +223,28 @@ def inspect(
         error_console.print(f"[yellow]Warning:[/] {error}")
     error_console.print(
         f"[dim]Inspected {len(media)}/{len(paths)} files; {cache_hits} cache hits; "
-        f"{len(errors)} warning(s).[/]"
+        f"{blocked_probes} blocked probe(s); {len(errors)} warning(s).[/]"
     )
     return sorted(media, key=lambda item: str(item.path).lower())
 
 
-def render(media: list[MediaFile], root: Path, view: str = "detailed") -> None:
+def policy_digest(settings: dict[str, object]) -> str:
+    encoded = json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def outcome_reason(record: dict[str, object]) -> str:
+    kind = str(record.get("type", "previous attempt failed"))
+    error = record.get("error")
+    return f"{kind}: {error}" if error else kind
+
+
+def render(
+    media: list[MediaFile],
+    root: Path,
+    view: str = "detailed",
+    states: Optional[dict[Path, dict[str, object]]] = None,
+) -> None:
     if view not in {"compact", "detailed"}:
         raise BrakeSmithError("View must be compact or detailed")
     table = Table(title=f"BrakeSmith scan · {root.resolve()}", show_lines=False)
@@ -212,6 +258,7 @@ def render(media: list[MediaFile], root: Path, view: str = "detailed") -> None:
         table.add_column("Size", justify="right")
     else:
         table.add_column("Reason")
+    states = states or {}
     for item in media:
 
         def track_label(track: object) -> str:
@@ -229,7 +276,19 @@ def render(media: list[MediaFile], root: Path, view: str = "detailed") -> None:
 
         audio = ", ".join(track_label(track) for track in item.audio) or "—"
         subs = ", ".join(track_label(track) for track in item.subtitles) or "—"
-        status = "[cyan]convert[/]" if item.should_convert else "[green]HEVC[/]"
+        state = states.get(item.path)
+        if not item.should_convert:
+            status = "[green]HEVC[/]"
+            reason = "already HEVC"
+        elif state and state.get("outcome") == "success":
+            status = "[green]done[/]"
+            reason = str(state.get("result", "successful output exists"))
+        elif FailureStore.blocks(state):
+            status = "[yellow]blocked[/]"
+            reason = outcome_reason(state)
+        else:
+            status = "[cyan]convert[/]"
+            reason = "video codec is not HEVC"
         video = f"{item.width}×{item.height}" if item.width and item.height else "unknown"
         if item.dolby_vision:
             video += " DV"
@@ -247,7 +306,6 @@ def render(media: list[MediaFile], root: Path, view: str = "detailed") -> None:
                 f"{item.size / 1_073_741_824:.2f} GB",
             )
         else:
-            reason = "video codec is not HEVC" if item.should_convert else "already HEVC"
             table.add_row(status, relative, item.codec, video, reason)
     console.print(table)
     groups = Counter(
@@ -267,21 +325,36 @@ def render(media: list[MediaFile], root: Path, view: str = "detailed") -> None:
             )
             + "[/]"
         )
+    blocked = sum(
+        item.should_convert and FailureStore.blocks(states.get(item.path)) for item in media
+    )
+    done = sum(
+        not item.should_convert or states.get(item.path, {}).get("outcome") == "success"
+        for item in media
+    )
+    ready = len(media) - blocked - done
     console.print(
-        f"[bold]{len(media)}[/] video(s), [bold cyan]{sum(m.should_convert for m in media)}[/] need conversion"
+        f"[bold]{len(media)}[/] video(s), [bold cyan]{ready}[/] ready, "
+        f"[bold green]{done}[/] done/not required, [bold yellow]{blocked}[/] blocked"
     )
 
 
-def display(media: list[MediaFile], root: Path, view: str, pager: bool = False) -> None:
+def display(
+    media: list[MediaFile],
+    root: Path,
+    view: str,
+    pager: bool = False,
+    states: Optional[dict[Path, dict[str, object]]] = None,
+) -> None:
     if pager and console.is_terminal:
         with console.pager(styles=True):
-            render(media, root, view)
+            render(media, root, view, states)
     else:
-        render(media, root, view)
+        render(media, root, view, states)
 
 
-def media_payload(item: MediaFile) -> dict[str, object]:
-    return {
+def media_payload(item: MediaFile, state: Optional[dict[str, object]] = None) -> dict[str, object]:
+    payload = {
         "path": str(item.path),
         "codec": item.codec,
         "should_convert": item.should_convert,
@@ -307,20 +380,53 @@ def media_payload(item: MediaFile) -> dict[str, object]:
         "sidecars": [str(path) for path in item.sidecars],
         "warnings": fidelity_warnings(item),
     }
+    if not item.should_convert:
+        payload["transcode_status"] = "not-required"
+    elif state and state.get("outcome") == "success":
+        payload["transcode_status"] = "success"
+    elif FailureStore.blocks(state):
+        payload["transcode_status"] = "blocked"
+        payload["blocked_reason"] = state.get("type")
+    else:
+        payload["transcode_status"] = "ready"
+    return payload
 
 
-def write_candidates_report(items: list[MediaFile], output: Path, force: bool = False) -> None:
+def write_candidates_report(
+    items: list[MediaFile],
+    output: Path,
+    force: bool = False,
+    states: Optional[dict[Path, dict[str, object]]] = None,
+) -> None:
     output = output.expanduser().resolve()
     if output.exists() and not force:
         raise BrakeSmithError(f"Report exists: {output}; pass --force to replace it")
     suffix = output.suffix.lower()
     if suffix == ".json":
-        content = json.dumps([media_payload(item) for item in items], indent=2) + "\n"
+        content = (
+            json.dumps(
+                [media_payload(item, (states or {}).get(item.path)) for item in items], indent=2
+            )
+            + "\n"
+        )
     elif suffix == ".csv":
         stream = io.StringIO()
         writer = csv.writer(stream)
-        writer.writerow(["path", "codec", "duration_seconds", "size_bytes", "audio", "subtitles"])
+        writer.writerow(
+            [
+                "path",
+                "codec",
+                "duration_seconds",
+                "size_bytes",
+                "audio",
+                "subtitles",
+                "transcode_status",
+                "blocked_reason",
+            ]
+        )
         for item in items:
+            state = (states or {}).get(item.path)
+            payload = media_payload(item, state)
             writer.writerow(
                 [
                     item.path,
@@ -329,6 +435,8 @@ def write_candidates_report(items: list[MediaFile], output: Path, force: bool = 
                     item.size,
                     ",".join(track.language for track in item.audio),
                     ",".join(track.language for track in item.subtitles),
+                    payload["transcode_status"],
+                    payload.get("blocked_reason", ""),
                 ]
             )
         content = stream.getvalue()
@@ -361,17 +469,21 @@ def scan(
         items = inspect(
             directory, depth, ffprobe, extensions, workers, probe_timeout, cache, use_cache
         )
+        store = FailureStore()
     except ScanInterrupted as error:
         error_console.print(f"[yellow]{error}[/]")
         raise typer.Exit(130)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
+    states = {
+        item.path: record for item in items if (record := store.active(item.path)) is not None
+    }
     if json_output:
-        payload = [media_payload(item) for item in items]
+        payload = [media_payload(item, states.get(item.path)) for item in items]
         typer.echo(json.dumps(payload, indent=2))
     else:
-        display(items, directory, view, pager)
+        display(items, directory, view, pager, states)
 
 
 @app.command()
@@ -392,6 +504,9 @@ def candidates(
     min_duration: float = typer.Option(0, min=0, help="Minimum duration in seconds."),
     max_duration: float = typer.Option(0, min=0, help="Maximum duration; 0 disables."),
     codecs: str = typer.Option("", help="Comma-separated source codecs to include."),
+    include_blocked: bool = typer.Option(
+        False, help="Include unchanged sources from remembered non-candidates."
+    ),
     view: str = typer.Option("compact", help="compact or detailed table."),
     pager: bool = typer.Option(False, help="Page interactive table output."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
@@ -425,18 +540,29 @@ def candidates(
             and (not max_duration or item.duration <= max_duration)
             and (not wanted_codecs or item.codec.lower() in wanted_codecs)
         ]
+        store = FailureStore()
+        items = exclude_remembered_failures(items, store, include_blocked)
+        states = {
+            item.path: record for item in items if (record := store.active(item.path)) is not None
+        }
         if output:
-            write_candidates_report(items, output, force)
+            write_candidates_report(items, output, force, states)
             console.print(f"[green]Saved:[/] {len(items)} conversion candidate(s) to {output}")
         else:
-            display(items, directory, view, pager)
+            display(items, directory, view, pager, states)
     except ScanInterrupted as error:
         if output:
             partial = output.with_name(f"{output.stem}.partial{output.suffix}")
             try:
-                write_candidates_report(
-                    [item for item in error.items if item.should_convert], partial, force=True
-                )
+                partial_items = [item for item in error.items if item.should_convert]
+                store = FailureStore()
+                partial_items = exclude_remembered_failures(partial_items, store, include_blocked)
+                states = {
+                    item.path: record
+                    for item in partial_items
+                    if (record := store.active(item.path)) is not None
+                }
+                write_candidates_report(partial_items, partial, force=True, states=states)
                 error_console.print(f"[yellow]Partial report saved:[/] {partial.resolve()}")
             except BrakeSmithError as report_error:
                 error_console.print(f"[red]Partial report failed:[/] {report_error}")
@@ -451,17 +577,477 @@ def candidates(
 def doctor(
     handbrake: Optional[Path] = typer.Option(None, help="Path to HandBrakeCLI."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
+    ffmpeg: Optional[Path] = typer.Option(None, help="Path to ffmpeg."),
 ) -> None:
     """Check required tools without changing files."""
-    checks = {
+    required = {
         "HandBrakeCLI": find_executable("HandBrakeCLI", handbrake),
         "ffprobe": find_executable("ffprobe", ffprobe),
     }
-    for name, path in checks.items():
+    for name, path in required.items():
         console.print(f"[green]✓[/] {name}: {path}" if path else f"[red]✗[/] {name}: not found")
-    if not all(checks.values()):
-        console.print("Install HandBrakeCLI and FFmpeg, or pass explicit paths.")
+    optional_ffmpeg = find_executable("ffmpeg", ffmpeg)
+    console.print(
+        f"[green]✓[/] ffmpeg (full health checks): {optional_ffmpeg}"
+        if optional_ffmpeg
+        else "[yellow]○[/] ffmpeg: optional; full health checks unavailable"
+    )
+    if not all(required.values()):
+        console.print("Install HandBrakeCLI and ffprobe, or pass explicit paths.")
         raise typer.Exit(1)
+
+
+def check_media_health(
+    path: Path,
+    full: bool,
+    ffprobe_executable: str | None,
+    ffmpeg_executable: str | None,
+    timeout: float,
+) -> dict[str, object]:
+    mode = "full" if full else "quick"
+    try:
+        if full:
+            if not ffmpeg_executable:
+                raise BrakeSmithError("ffmpeg not found")
+            result = subprocess.run(
+                [
+                    ffmpeg_executable,
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-nostdin",
+                    "-i",
+                    str(path),
+                    "-map",
+                    "0:v?",
+                    "-map",
+                    "0:a?",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout or None,
+                check=False,
+            )
+            if result.returncode:
+                details = (result.stderr or result.stdout).strip()[-2000:]
+                raise BrakeSmithError(details or f"ffmpeg exited with {result.returncode}")
+        else:
+            if not ffprobe_executable:
+                raise BrakeSmithError("ffprobe not found")
+            probe(path, ffprobe_executable, timeout or None)
+    except subprocess.TimeoutExpired:
+        return {"path": str(path), "mode": mode, "status": "error", "error": "timed out"}
+    except (BrakeSmithError, OSError) as error:
+        return {"path": str(path), "mode": mode, "status": "error", "error": str(error)}
+    return {"path": str(path), "mode": mode, "status": "healthy", "error": None}
+
+
+@app.command(name="health")
+def health_check(
+    directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
+    full: bool = typer.Option(False, "--full/--quick", help="Decode all frames or check headers."),
+    depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
+    timeout: float = typer.Option(0, min=0, help="Seconds per file; 0 disables timeout."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+    extensions: str = typer.Option("", help="Extra comma-separated file extensions."),
+    ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
+    ffmpeg: Optional[Path] = typer.Option(None, help="Path to ffmpeg."),
+) -> None:
+    """Check media headers or decode all video and audio frames."""
+    ffprobe_executable = find_executable("ffprobe", ffprobe) if not full else None
+    ffmpeg_executable = find_executable("ffmpeg", ffmpeg) if full else None
+    if (full and not ffmpeg_executable) or (not full and not ffprobe_executable):
+        tool = "ffmpeg" if full else "ffprobe"
+        console.print(f"[red]Error:[/] {tool} not found.")
+        raise typer.Exit(2)
+    traversal_errors: list[str] = []
+    paths = discover(
+        directory,
+        None if depth < 0 else depth,
+        extensions.split(",") if extensions else (),
+        errors=traversal_errors,
+    )
+    results: list[dict[str, object]] = []
+    with Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=error_console,
+        disable=json_output,
+    ) as progress:
+        task = progress.add_task("Checking media health", total=len(paths))
+        try:
+            for path in paths:
+                results.append(
+                    check_media_health(path, full, ffprobe_executable, ffmpeg_executable, timeout)
+                )
+                progress.advance(task)
+        except KeyboardInterrupt:
+            error_console.print("[yellow]Health check cancelled.[/]")
+            raise typer.Exit(130)
+    for error in traversal_errors:
+        error_console.print(f"[yellow]Warning:[/] {error}")
+    if json_output:
+        typer.echo(json.dumps(results, indent=2))
+    else:
+        table = Table(title=f"BrakeSmith health · {directory}", show_lines=True)
+        table.add_column("Status", no_wrap=True)
+        table.add_column("Mode", no_wrap=True)
+        table.add_column("File", overflow="fold", ratio=3)
+        table.add_column("Details", overflow="fold", ratio=2)
+        for result in results:
+            status = "[green]healthy[/]" if result["status"] == "healthy" else "[red]error[/]"
+            table.add_row(
+                status,
+                str(result["mode"]),
+                str(result["path"]),
+                str(result["error"] or "—"),
+            )
+        console.print(table)
+        errors = sum(result["status"] == "error" for result in results)
+        console.print(f"{len(results) - errors} healthy, {errors} error(s).")
+    if any(result["status"] == "error" for result in results):
+        raise typer.Exit(1)
+
+
+@failures_app.command(name="list")
+def list_failures(
+    kind: Optional[str] = typer.Option(None, "--type", help="Filter by failure type."),
+) -> None:
+    """List remembered source files that normal runs will not propose."""
+    if kind and kind not in FAILURE_TYPES:
+        console.print(f"[red]Error:[/] --type must be one of: {', '.join(sorted(FAILURE_TYPES))}")
+        raise typer.Exit(2)
+    try:
+        store = FailureStore()
+        records = [record for record in store.records(kind) if FailureStore.blocks(record)]
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    if not records:
+        console.print("No remembered non-candidates.")
+        return
+    table = Table(title=f"BrakeSmith failures · {store.path}", show_lines=True)
+    table.add_column("Source", overflow="fold", ratio=3)
+    table.add_column("Reason", no_wrap=True)
+    table.add_column("Active", no_wrap=True)
+    table.add_column("Details", overflow="fold", ratio=2)
+    for record in records:
+        source = Path(str(record["source"]))
+        table.add_row(
+            f"{source.name}\n{source.parent}",
+            str(record.get("type", "unknown")),
+            "yes" if store.active(source) else "no",
+            f"Recorded: {record.get('failed_at', '')}\nDetails: {record.get('error', '')}\n"
+            f"Log: {record.get('log') or '—'}",
+        )
+    console.print(table)
+
+
+@failures_app.command(name="clear")
+def clear_failures(
+    kind: Optional[str] = typer.Option(None, "--type", help="Clear only one failure type."),
+    logs_only: bool = typer.Option(False, help="Delete logs but keep skip records."),
+    keep_logs: bool = typer.Option(False, help="Clear records but retain log files."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Clear remembered non-candidates and their centralized logs."""
+    if kind and kind not in FAILURE_TYPES:
+        console.print(f"[red]Error:[/] --type must be one of: {', '.join(sorted(FAILURE_TYPES))}")
+        raise typer.Exit(2)
+    if logs_only and keep_logs:
+        console.print("[red]Error:[/] --logs-only and --keep-logs cannot be combined")
+        raise typer.Exit(2)
+    try:
+        store = FailureStore()
+        count = sum(FailureStore.blocks(record) for record in store.records(kind))
+        pattern = f"*-{kind}.log" if kind else "*.log"
+        log_count = sum(1 for _ in store.logs.glob(pattern))
+        if not count and not (logs_only and log_count):
+            console.print("No matching failures.")
+            return
+        target = (
+            f"{log_count} log(s)"
+            if logs_only
+            else f"{count} record(s)" + (f" of type {kind}" if kind else "")
+        )
+        if not yes and not Confirm.ask(f"Clear {target}?", default=False):
+            console.print("Cancelled.")
+            return
+        records_removed, logs_removed = store.clear(kind, logs_only, keep_logs)
+    except (BrakeSmithError, OSError) as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    console.print(f"[green]Cleared:[/] {records_removed} record(s), {logs_removed} log(s).")
+
+
+@failures_app.command(name="forget")
+def forget_failures(
+    sources: list[Path] = typer.Argument(..., help="Source paths to propose again."),
+    keep_logs: bool = typer.Option(False, help="Retain diagnostic log files."),
+) -> None:
+    """Forget specific sources so later runs can propose them again."""
+    try:
+        records_removed, logs_removed = FailureStore().forget(sources, keep_logs)
+    except (BrakeSmithError, OSError) as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    console.print(f"[green]Forgot:[/] {records_removed} source(s), {logs_removed} log(s).")
+
+
+@failures_app.command(name="prune")
+def prune_failures() -> None:
+    """Remove records for missing or changed sources and orphan logs."""
+    try:
+        records_removed, logs_removed = FailureStore().prune()
+    except (BrakeSmithError, OSError) as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    console.print(
+        f"[green]Pruned:[/] {records_removed} stale record(s), {logs_removed} orphan log(s)."
+    )
+
+
+@failures_app.command(name="path")
+def failure_path() -> None:
+    """Show failure registry and log directory."""
+    store = FailureStore()
+    console.print(f"Registry: {store.path}\nLogs: {store.logs}")
+
+
+def path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+    except ValueError:
+        return False
+    return True
+
+
+@app.command(name="retry")
+def retry_outcomes(
+    sources: list[Path] = typer.Argument(None, help="Specific source paths to retry."),
+    root: Optional[Path] = typer.Option(None, help="Retry blocked files under this directory."),
+    kind: Optional[str] = typer.Option(None, "--type", help="Retry only this failure type."),
+) -> None:
+    """Release selected blocked files for the next run or plan."""
+    if kind and kind not in FAILURE_TYPES:
+        console.print(f"[red]Error:[/] --type must be one of: {', '.join(sorted(FAILURE_TYPES))}")
+        raise typer.Exit(2)
+    if not sources and root is None and kind is None:
+        console.print("[red]Error:[/] Select source paths, --root, or --type.")
+        raise typer.Exit(2)
+    try:
+        store = FailureStore()
+        wanted = {store.key(source) for source in (sources or [])}
+        selected = []
+        for record in store.records(kind):
+            source = Path(str(record["source"]))
+            if not FailureStore.blocks(record):
+                continue
+            if wanted and store.key(source) not in wanted:
+                continue
+            if root is not None and not path_is_under(source, root):
+                continue
+            selected.append(source)
+        released = store.release(selected)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    console.print(f"[green]Ready to retry:[/] {released} source(s). Run `brakesmith run`.")
+
+
+@app.command(name="history")
+def show_history(
+    root: Path = typer.Argument(Path("."), help="Show records under this directory."),
+    kind: Optional[str] = typer.Option(None, "--type", help="Filter attempt type."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Show bounded transcode attempt history."""
+    valid_types = {*FAILURE_TYPES, "success"}
+    if kind and kind not in valid_types:
+        console.print(f"[red]Error:[/] --type must be one of: {', '.join(sorted(valid_types))}")
+        raise typer.Exit(2)
+    try:
+        store = FailureStore()
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    payload = []
+    for record in store.records():
+        source = Path(str(record["source"]))
+        if not path_is_under(source, root):
+            continue
+        attempts = record.get("history")
+        if not isinstance(attempts, list):
+            attempts = [
+                {
+                    "recorded_at": record.get("recorded_at", record.get("failed_at")),
+                    "outcome": record.get("outcome", "blocked"),
+                    "type": record.get("type"),
+                    "error": record.get("error"),
+                }
+            ]
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or (kind and attempt.get("type") != kind):
+                continue
+            payload.append({"source": str(source), **attempt})
+    payload.sort(key=lambda item: str(item.get("recorded_at", "")), reverse=True)
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    if not payload:
+        console.print("No matching history.")
+        return
+    table = Table(title=f"BrakeSmith history · {root.resolve()}", show_lines=True)
+    table.add_column("Time", no_wrap=True)
+    table.add_column("Outcome", no_wrap=True)
+    table.add_column("Type", no_wrap=True)
+    table.add_column("Source", overflow="fold")
+    table.add_column("Details", overflow="fold")
+    for attempt in payload:
+        table.add_row(
+            str(attempt.get("recorded_at", "")),
+            str(attempt.get("outcome", "")),
+            str(attempt.get("type", "")),
+            str(attempt["source"]),
+            str(attempt.get("error") or attempt.get("result") or "—"),
+        )
+    console.print(table)
+
+
+def library_status_entries(
+    items: list[MediaFile], store: FailureStore, root: Path
+) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = store.key(item.path)
+        seen.add(key)
+        saved = store.items.get(key)
+        active = store.active(item.path)
+        if not item.should_convert:
+            group, reason = "success", "already HEVC"
+        elif active and active.get("outcome") == "success":
+            group, reason = "success", str(active.get("result", "successful output exists"))
+        elif FailureStore.blocks(active):
+            group, reason = "blocked", outcome_reason(active)
+        else:
+            group = "ready"
+            if active and active.get("outcome") == "ready":
+                reason = str(active.get("result", "ready"))
+            elif saved and saved.get("retry_requested"):
+                reason = "retry requested"
+            elif saved:
+                reason = "source or output changed"
+            else:
+                reason = "video codec is not HEVC"
+        entries.append(
+            {
+                "group": group,
+                "source": str(item.path),
+                "reason": reason,
+                "size": item.size,
+                "duration": item.duration,
+            }
+        )
+    for record in store.records():
+        source = Path(str(record["source"]))
+        key = store.key(source)
+        if key in seen or not path_is_under(source, root):
+            continue
+        active = store.active(source)
+        if (
+            active
+            and active.get("outcome") == "success"
+            and active.get("output")
+            and store.key(Path(str(active["output"]))) in seen
+        ):
+            continue
+        if active and active.get("outcome") == "success":
+            group, reason = "success", str(active.get("result", "successful output exists"))
+        elif FailureStore.blocks(active):
+            group, reason = "blocked", outcome_reason(active)
+        else:
+            group, reason = "stale", "source, output, or settings changed or is missing"
+        entries.append(
+            {
+                "group": group,
+                "source": str(source),
+                "reason": reason,
+                "size": record.get("source_size") or 0,
+                "duration": record.get("duration") or 0,
+            }
+        )
+    order = {"ready": 0, "success": 1, "blocked": 2, "stale": 3}
+    return sorted(entries, key=lambda item: (order[str(item["group"])], str(item["source"])))
+
+
+@app.command(name="status")
+def library_status(
+    directory: Path = typer.Argument(Path("."), exists=True, file_okay=False, resolve_path=True),
+    depth: int = typer.Option(-1, help="Subdirectory depth; -1 means recursive."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+    extensions: str = typer.Option("", help="Extra comma-separated file extensions."),
+    workers: int = typer.Option(2, min=1, max=32, help="Concurrent metadata probes."),
+    probe_timeout: float = typer.Option(60, min=1, help="Seconds allowed per metadata probe."),
+    cache: Optional[Path] = typer.Option(None, "--cache-file", help="Local probe-cache path."),
+    use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use local probe cache."),
+    ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
+) -> None:
+    """Show ready, successful, blocked, and stale library files."""
+    try:
+        items = inspect(
+            directory, depth, ffprobe, extensions, workers, probe_timeout, cache, use_cache
+        )
+        entries = library_status_entries(items, FailureStore(), directory)
+    except ScanInterrupted as error:
+        error_console.print(f"[yellow]{error}[/]")
+        raise typer.Exit(130)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
+    totals = {
+        group: {
+            "files": sum(entry["group"] == group for entry in entries),
+            "bytes": sum(int(entry["size"]) for entry in entries if entry["group"] == group),
+            "duration_seconds": sum(
+                float(entry["duration"]) for entry in entries if entry["group"] == group
+            ),
+        }
+        for group in ("ready", "success", "blocked", "stale")
+    }
+    if json_output:
+        typer.echo(
+            json.dumps({"root": str(directory), "totals": totals, "items": entries}, indent=2)
+        )
+        return
+    labels = {
+        "ready": "Ready",
+        "success": "Success / not required",
+        "blocked": "Blocked",
+        "stale": "Missing / stale",
+    }
+    table = Table(title=f"BrakeSmith status · {directory}", show_lines=True)
+    table.add_column("State", no_wrap=True)
+    table.add_column("Source", overflow="fold", ratio=3)
+    table.add_column("Reason", overflow="fold", ratio=2)
+    table.add_column("Size", justify="right")
+    table.add_column("Duration", justify="right")
+    for entry in entries:
+        table.add_row(
+            labels[str(entry["group"])],
+            str(entry["source"]),
+            str(entry["reason"]),
+            f"{int(entry['size']) / 1_073_741_824:.2f} GB",
+            f"{float(entry['duration']) / 3600:.2f} h",
+        )
+    console.print(table)
+    console.print(" · ".join(f"{labels[group]}: {totals[group]['files']}" for group in totals))
 
 
 def reconcile_original(
@@ -533,8 +1119,7 @@ def format_description(name: str, choice: FormatChoice) -> str:
         )
     values = FORMAT_PRESETS[name]
     tiers = " · ".join(
-        f"{resolution} RF {quality:g}/{preset}"
-        for resolution, (quality, preset) in values.items()
+        f"{resolution} RF {quality:g}/{preset}" for resolution, (quality, preset) in values.items()
     )
     return (
         f"{tiers} · H.265 Main 10 · MKV · AAC stereo 160k + EAC3 surround "
@@ -566,9 +1151,7 @@ def reconcile_format_choice(
 ) -> FormatChoice:
     fallback = FormatChoice(requested or "recommended", quality, preset, bit_depth, encoder_profile)
     if fallback.name not in {*FORMAT_PRESETS, "custom"}:
-        raise BrakeSmithError(
-            f"--format-preset must be {', '.join([*FORMAT_PRESETS, 'custom'])}"
-        )
+        raise BrakeSmithError(f"--format-preset must be {', '.join([*FORMAT_PRESETS, 'custom'])}")
     if non_interactive or requested:
         return fallback
 
@@ -657,6 +1240,50 @@ def limit_proposed_files(items: list[MediaFile], maximum: Optional[int]) -> list
         return items
     console.print(f"Proposing first {maximum} of {len(items)} conversion candidate(s).")
     return items[:maximum]
+
+
+def exclude_remembered_failures(
+    items: list[MediaFile],
+    store: FailureStore,
+    retry_failed: bool,
+    policy_hash: str | None = None,
+) -> list[MediaFile]:
+    blocked = {
+        item.path
+        for item in items
+        if (record := store.active(item.path, policy_hash))
+        and (
+            record.get("outcome") == "success" or (not retry_failed and FailureStore.blocks(record))
+        )
+    }
+    if blocked:
+        console.print(
+            f"[yellow]Skipped {len(blocked)} remembered non-candidate(s).[/] "
+            "Use `brakesmith failures list` or --retry-blocked."
+        )
+    return [item for item in items if item.path not in blocked]
+
+
+def require_matching_existing_output(
+    store: FailureStore,
+    source: Path,
+    destination: Path,
+    policy_hash: str | None,
+) -> None:
+    saved = store.items.get(store.key(source))
+    if not saved or saved.get("outcome") != "success":
+        return
+    active = store.active(source)
+    recorded_output = Path(str(saved.get("output", ""))).expanduser().resolve()
+    if (
+        not active
+        or recorded_output != destination.expanduser().resolve()
+        or saved.get("policy_hash") != policy_hash
+    ):
+        raise BrakeSmithError(
+            "Existing output belongs to a different recorded source or transcode policy. "
+            "Remove it or forget the saved outcome before you adopt it."
+        )
 
 
 def reconcile_languages(
@@ -789,10 +1416,20 @@ def plan_batch(
         "--replace-source/--keep-source",
         help="Replace each source only when its validated HEVC output is smaller.",
     ),
+    stop_when_larger: bool = typer.Option(
+        False,
+        help="Stop replacement encodes when the partial output reaches source size.",
+    ),
     overrides: Optional[Path] = typer.Option(
         None, exists=True, dir_okay=False, help="Per-source audio_tracks/subtitle_tracks JSON."
     ),
     allow_no_audio: bool = typer.Option(False),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-blocked",
+        "--retry-failed",
+        help="Include remembered non-candidates in this plan.",
+    ),
     extensions: str = typer.Option(""),
     workers: int = typer.Option(2, min=1, max=32),
     probe_timeout: float = typer.Option(60, min=1),
@@ -816,9 +1453,7 @@ def plan_batch(
         unknown_subtitles = str(
             prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
         )
-        format_preset = prefer_profile(
-            profile_settings, "format_preset", format_preset, None
-        )
+        format_preset = prefer_profile(profile_settings, "format_preset", format_preset, None)
         format_preset = str(format_preset) if format_preset else None
         quality = float(prefer_profile(profile_settings, "quality", quality, 18.0))
         preset = str(prefer_profile(profile_settings, "preset", preset, "slow"))
@@ -835,6 +1470,9 @@ def plan_batch(
     if not executable or not ffprobe_executable:
         console.print("[red]Error:[/] HandBrakeCLI or ffprobe not found. Run `brakesmith doctor`.")
         raise typer.Exit(2)
+    if stop_when_larger and not replace_source:
+        console.print("[red]Error:[/] --stop-when-larger requires --replace-source.")
+        raise typer.Exit(2)
     try:
         format_choice = reconcile_format_choice(
             format_preset,
@@ -848,24 +1486,58 @@ def plan_batch(
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
+    overrides_hash = None
+    if overrides:
+        try:
+            overrides_hash = sha256(overrides.read_bytes()).hexdigest()
+        except OSError as error:
+            console.print(f"[red]Error:[/] Cannot read overrides {overrides}: {error}")
+            raise typer.Exit(2)
+    policy_hash = policy_digest(
+        {
+            "format": vars(format_choice),
+            "format_values": FORMAT_PRESETS.get(format_choice.name),
+            "audio": audio,
+            "subtitles": subtitles,
+            "unknown_audio": unknown_audio,
+            "unknown_subtitles": unknown_subtitles,
+            "keep_commentary": keep_commentary,
+            "forced_subtitles_only": forced_subtitles_only,
+            "exclude_titles": exclude_titles,
+            "keep_original": keep_original,
+            "original_language": original_language,
+            "tune": tune,
+            "level": encoder_level,
+            "crop": crop,
+            "deinterlace": deinterlace,
+            "lossless": lossless,
+            "replace_source": replace_source,
+            "output_directory": output_directory,
+            "allow_no_audio": allow_no_audio,
+            "overrides": overrides_hash,
+        }
+    )
     try:
-        items = limit_proposed_files(
-            [
-                item
-                for item in inspect(
-                    directory,
-                    depth,
-                    ffprobe,
-                    extensions,
-                    workers,
-                    probe_timeout,
-                    cache,
-                    use_cache,
-                )
-                if item.should_convert
-            ],
-            max_files,
+        candidates = [
+            item
+            for item in inspect(
+                directory,
+                depth,
+                ffprobe,
+                extensions,
+                workers,
+                probe_timeout,
+                cache,
+                use_cache,
+                retry_blocked=retry_failed,
+            )
+            if item.should_convert
+        ]
+        failure_store = FailureStore()
+        candidates = exclude_remembered_failures(
+            candidates, failure_store, retry_failed, policy_hash
         )
+        items = limit_proposed_files(candidates, max_files)
         if not items:
             console.print("No conversion candidates.")
             return
@@ -989,6 +1661,8 @@ def plan_batch(
                         item, selected_audio, format_settings.library_audio
                     ),
                     "replace_source": replace_source,
+                    "stop_when_larger": stop_when_larger,
+                    "policy_hash": policy_hash,
                     "warnings": fidelity_warnings(item),
                     "format": {
                         "preset": format_settings.name,
@@ -1047,6 +1721,8 @@ def plan_batch(
                 "audio_languages": audio_languages,
                 "subtitle_languages": subtitle_languages,
                 "replace_source": replace_source,
+                "stop_when_larger": stop_when_larger,
+                "policy_hash": policy_hash,
             },
             "totals": {
                 "files": len(plan_items),
@@ -1083,7 +1759,12 @@ app.command(name="dry-run", help="Alias for plan; writes a non-destructive revie
 def execute_plan(
     plan_file: Path = typer.Argument(..., exists=True, dir_okay=False, resolve_path=True),
     state_file: Optional[Path] = typer.Option(None, help="Atomic state journal path."),
-    retry_failed: bool = typer.Option(False, help="Process only previously failed items."),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-blocked",
+        "--retry-failed",
+        help="Process only previously failed or not-smaller items.",
+    ),
     stop_after_current: bool = typer.Option(False, help="Stop cleanly after one attempted file."),
     max_failures: int = typer.Option(
         1, min=0, help="Stop after this many failures; 0 is unlimited."
@@ -1095,6 +1776,7 @@ def execute_plan(
         plan_digest = str(plan["digest"])
         journal_path = state_file or plan_file.with_name(f"{plan_file.stem}.state.json")
         state = load_state(journal_path, plan_digest)
+        failure_store = FailureStore()
         statuses = state["items"]
         assert isinstance(statuses, dict)
         items = plan["items"]
@@ -1133,7 +1815,7 @@ def execute_plan(
                     partial = Path(str(item["partial"]))
                     previous = statuses.get(str(source), {})
                     previous_status = previous.get("status") if isinstance(previous, dict) else None
-                    if retry_failed and previous_status != "failed":
+                    if retry_failed and not retryable_plan_status(previous):
                         completed_weight += weight
                         progress.update(total_task, completed=completed_weight)
                         continue
@@ -1145,8 +1827,11 @@ def execute_plan(
                     file_task = progress.add_task(
                         f"[{file_number}/{len(items)}] {source.name}", total=100
                     )
-                    diagnostics: list[str] = []
+                    diagnostics: deque[str] = deque(maxlen=500)
                     process: Optional[subprocess.Popen[str]] = None
+                    failure_type = "source"
+                    policy_hash = str(item.get("policy_hash") or "") or None
+                    stop_when_larger = bool(item.get("stop_when_larger", False))
                     try:
                         raw_snapshot = item["snapshot"]
                         assert isinstance(raw_snapshot, dict)
@@ -1163,6 +1848,10 @@ def execute_plan(
                         )
                         expected_subtitles = len(item["subtitle_tracks"])
                         if not source.exists() and replace_source and destination.exists():
+                            failure_type = "validation"
+                            require_matching_existing_output(
+                                failure_store, source, destination, policy_hash
+                            )
                             validate_output(
                                 destination,
                                 ffprobe_executable,
@@ -1177,10 +1866,25 @@ def execute_plan(
                                 "recovered": True,
                                 "source_deleted": True,
                             }
+                            remember_success(
+                                failure_store,
+                                source,
+                                destination,
+                                policy_hash,
+                                "recovered-published",
+                                duration,
+                                snapshot.size,
+                                snapshot.modified_ns,
+                                True,
+                            )
                             progress.update(file_task, completed=100)
                             continue
                         ensure_source_unchanged(snapshot)
                         if destination.exists():
+                            failure_type = "validation"
+                            require_matching_existing_output(
+                                failure_store, source, destination, policy_hash
+                            )
                             validate_output(
                                 destination,
                                 ffprobe_executable,
@@ -1195,6 +1899,7 @@ def execute_plan(
                                 else None
                             )
                             if replace_source and discarded_size is None:
+                                failure_type = "source-delete"
                                 delete_replaced_source(source, destination)
                             statuses[str(source)] = {
                                 "status": "completed",
@@ -1214,9 +1919,30 @@ def execute_plan(
                                     f"[yellow]Kept source:[/] output was not smaller "
                                     f"({discarded_size} >= {snapshot.size} bytes): {source}"
                                 )
+                                remember_not_smaller(
+                                    failure_store,
+                                    source,
+                                    snapshot.size,
+                                    discarded_size,
+                                    policy_hash=policy_hash,
+                                    duration=duration,
+                                )
+                            else:
+                                remember_success(
+                                    failure_store,
+                                    source,
+                                    destination,
+                                    policy_hash,
+                                    "validated-existing",
+                                    duration,
+                                    snapshot.size,
+                                    snapshot.modified_ns,
+                                    replace_source,
+                                )
                         else:
                             if partial.exists():
                                 ensure_source_unchanged(snapshot)
+                                failure_type = "validation"
                                 validate_output(
                                     partial,
                                     ffprobe_executable,
@@ -1231,8 +1957,10 @@ def execute_plan(
                                     else None
                                 )
                                 if discarded_size is None:
+                                    failure_type = "publish"
                                     partial.replace(destination)
                                     if replace_source:
+                                        failure_type = "source-delete"
                                         delete_replaced_source(source, destination)
                                 statuses[str(source)] = {
                                     "status": "completed",
@@ -1254,6 +1982,26 @@ def execute_plan(
                                         f"[yellow]Kept source:[/] output was not smaller "
                                         f"({discarded_size} >= {snapshot.size} bytes): {source}"
                                     )
+                                    remember_not_smaller(
+                                        failure_store,
+                                        source,
+                                        snapshot.size,
+                                        discarded_size,
+                                        policy_hash=policy_hash,
+                                        duration=duration,
+                                    )
+                                else:
+                                    remember_success(
+                                        failure_store,
+                                        source,
+                                        destination,
+                                        policy_hash,
+                                        "recovered-partial",
+                                        duration,
+                                        snapshot.size,
+                                        snapshot.modified_ns,
+                                        replace_source,
+                                    )
                             else:
                                 preflight_destination(destination, snapshot.size)
                                 command = item["command"]
@@ -1261,6 +2009,7 @@ def execute_plan(
                                     isinstance(value, str) for value in command
                                 ):
                                     raise BrakeSmithError(f"Invalid planned command for {source}")
+                                failure_type = "encode"
                                 process = subprocess.Popen(
                                     command,
                                     stdout=subprocess.PIPE,
@@ -1269,6 +2018,7 @@ def execute_plan(
                                     errors="replace",
                                 )
                                 assert process.stdout is not None
+                                early_size: Optional[int] = None
                                 for line in process.stdout:
                                     diagnostics.append(line)
                                     match = progress_pattern.search(line)
@@ -1279,9 +2029,50 @@ def execute_plan(
                                             total_task,
                                             completed=completed_weight + weight * percent / 100,
                                         )
+                                    if replace_source and stop_when_larger:
+                                        early_size = partial_reached_source_size(
+                                            partial, snapshot.size
+                                        )
+                                        if early_size is not None:
+                                            terminate_process(process)
+                                            break
+                                if early_size is not None:
+                                    cleanup_error = remember_oversized_partial(
+                                        failure_store,
+                                        source,
+                                        partial,
+                                        snapshot.size,
+                                        early_size,
+                                        diagnostics,
+                                        policy_hash,
+                                        duration,
+                                    )
+                                    statuses[str(source)] = {
+                                        "status": "failed" if cleanup_error else "completed",
+                                        "type": "stale-partial" if cleanup_error else "not-smaller",
+                                        "output": None,
+                                        "result": (
+                                            None if cleanup_error else "kept-source-not-smaller"
+                                        ),
+                                        "early_stop": True,
+                                        "source_bytes": snapshot.size,
+                                        "output_bytes": early_size,
+                                        "cleanup_error": cleanup_error,
+                                    }
+                                    if cleanup_error:
+                                        failures += 1
+                                        console.print(f"[red]Failed:[/] {cleanup_error}")
+                                    else:
+                                        console.print(
+                                            f"[yellow]Stopped early:[/] partial reached source size "
+                                            f"({early_size} >= {snapshot.size} bytes): {source}"
+                                        )
+                                    progress.update(file_task, completed=100)
+                                    continue
                                 if process.wait() != 0:
                                     raise BrakeSmithError(f"HandBrake failed for {source.name}")
                                 ensure_source_unchanged(snapshot)
+                                failure_type = "validation"
                                 validate_output(
                                     partial,
                                     ffprobe_executable,
@@ -1296,8 +2087,10 @@ def execute_plan(
                                     else None
                                 )
                                 if discarded_size is None:
+                                    failure_type = "publish"
                                     partial.replace(destination)
                                     if replace_source:
+                                        failure_type = "source-delete"
                                         delete_replaced_source(source, destination)
                                 statuses[str(source)] = {
                                     "status": "completed",
@@ -1318,6 +2111,27 @@ def execute_plan(
                                         f"[yellow]Kept source:[/] output was not smaller "
                                         f"({discarded_size} >= {snapshot.size} bytes): {source}"
                                     )
+                                    remember_not_smaller(
+                                        failure_store,
+                                        source,
+                                        snapshot.size,
+                                        discarded_size,
+                                        diagnostics,
+                                        policy_hash,
+                                        duration,
+                                    )
+                                else:
+                                    remember_success(
+                                        failure_store,
+                                        source,
+                                        destination,
+                                        policy_hash,
+                                        "published",
+                                        duration,
+                                        snapshot.size,
+                                        snapshot.modified_ns,
+                                        replace_source,
+                                    )
                         progress.update(file_task, completed=100)
                     except KeyboardInterrupt:
                         terminate_process(process)
@@ -1326,6 +2140,18 @@ def execute_plan(
                             "status": "cancelled",
                             "error": cleanup_error,
                         }
+                        try:
+                            failure_store.record(
+                                source,
+                                "cancelled",
+                                "Conversion cancelled",
+                                diagnostics,
+                                cleanup_error,
+                                policy_hash,
+                                duration,
+                            )
+                        except BrakeSmithError:
+                            pass
                         write_state(journal_path, state)
                         console.print(
                             "\n[yellow]Cancelled.[/] State saved; completed replacements remain."
@@ -1333,23 +2159,26 @@ def execute_plan(
                         raise typer.Exit(130)
                     except Exception as error:  # noqa: BLE001 - durable state needs every failure
                         terminate_process(process)
-                        quarantined: Optional[Path] = None
-                        if partial.exists():
-                            try:
-                                quarantined = quarantine_file(partial, "invalid")
-                            except BrakeSmithError:
-                                pass
                         log_path: Optional[Path] = None
-                        if diagnostics:
-                            try:
-                                log_path = write_failure_log(destination, diagnostics)
-                            except OSError:
-                                pass
+                        try:
+                            log_path, cleanup_error = remember_failure(
+                                failure_store,
+                                source,
+                                partial,
+                                failure_type,
+                                str(error),
+                                diagnostics,
+                                policy_hash,
+                                duration,
+                            )
+                        except BrakeSmithError:
+                            cleanup_error = cleanup_partial(partial)
                         failures += 1
                         statuses[str(source)] = {
                             "status": "failed",
+                            "type": failure_type,
                             "error": str(error),
-                            "quarantined": str(quarantined) if quarantined else None,
+                            "cleanup_error": cleanup_error,
                             "log": str(log_path) if log_path else None,
                         }
                         console.print(f"[red]Failed:[/] {source}: {error}")
@@ -1383,12 +2212,141 @@ def terminate_process(process: Optional[subprocess.Popen[str]]) -> None:
         process.wait(timeout=5)
 
 
+def retryable_plan_status(status: object) -> bool:
+    return isinstance(status, dict) and (
+        status.get("status") in {"failed", "cancelled"}
+        or status.get("result") == "kept-source-not-smaller"
+    )
+
+
 def cleanup_partial(path: Path) -> Optional[str]:
     try:
         path.unlink(missing_ok=True)
     except OSError as error:
         return f"Could not remove partial output {path}: {error}"
     return None
+
+
+def remember_failure(
+    store: FailureStore,
+    source: Path,
+    partial: Path,
+    kind: str,
+    error: str,
+    diagnostics: Iterable[str],
+    policy_hash: str | None = None,
+    duration: float | None = None,
+) -> tuple[Path, Optional[str]]:
+    cleanup_error = cleanup_partial(partial)
+    record = store.record(
+        source,
+        kind,
+        error,
+        diagnostics,
+        cleanup_error,
+        policy_hash,
+        duration,
+    )
+    return Path(str(record["log"])), cleanup_error
+
+
+def remember_not_smaller(
+    store: FailureStore,
+    source: Path,
+    source_size: int,
+    output_size: int,
+    diagnostics: Iterable[str] = (),
+    policy_hash: str | None = None,
+    duration: float | None = None,
+    early: bool = False,
+) -> Optional[Path]:
+    prefix = "Partial output reached source size" if early else "Output was not smaller"
+    message = f"{prefix} ({output_size} >= {source_size} bytes)"
+    try:
+        record = store.record(
+            source,
+            "not-smaller",
+            message,
+            diagnostics,
+            policy_hash=policy_hash,
+            duration=duration,
+        )
+    except BrakeSmithError as error:
+        console.print(f"[red]Warning:[/] Cannot remember non-candidate: {error}")
+        return None
+    return Path(str(record["log"]))
+
+
+def remember_oversized_partial(
+    store: FailureStore,
+    source: Path,
+    partial: Path,
+    source_size: int,
+    output_size: int,
+    diagnostics: Iterable[str],
+    policy_hash: str | None,
+    duration: float,
+) -> Optional[str]:
+    cleanup_error = cleanup_partial(partial)
+    if cleanup_error:
+        try:
+            store.record(
+                source,
+                "stale-partial",
+                "Partial output reached source size, but BrakeSmith could not remove it.",
+                diagnostics,
+                cleanup_error,
+                policy_hash,
+                duration,
+            )
+        except BrakeSmithError as error:
+            console.print(f"[red]Warning:[/] Cannot remember stale partial: {error}")
+        return cleanup_error
+    remember_not_smaller(
+        store,
+        source,
+        source_size,
+        output_size,
+        diagnostics,
+        policy_hash,
+        duration,
+        early=True,
+    )
+    return None
+
+
+def remember_success(
+    store: FailureStore,
+    source: Path,
+    output: Path,
+    policy_hash: str | None,
+    result: str,
+    duration: float,
+    source_size: int,
+    source_modified_ns: int,
+    source_deleted: bool,
+) -> None:
+    try:
+        store.succeeded(
+            source,
+            output,
+            policy_hash,
+            result,
+            duration,
+            source_size,
+            source_modified_ns,
+            source_deleted,
+        )
+    except BrakeSmithError as error:
+        console.print(f"[red]Warning:[/] Cannot save successful outcome: {error}")
+
+
+def partial_reached_source_size(path: Path, source_size: int) -> Optional[int]:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    return size if size >= source_size else None
 
 
 def discard_not_smaller(output: Path, source_size: int) -> Optional[int]:
@@ -1408,16 +2366,6 @@ def delete_replaced_source(source: Path, destination: Path) -> None:
         raise BrakeSmithError(
             f"Validated output is safe at {destination}, but source could not be deleted: {error}"
         ) from error
-
-
-def write_failure_log(destination: Path, lines: list[str]) -> Path:
-    candidate = destination.with_name(f"{destination.name}.handbrake.log")
-    counter = 1
-    while candidate.exists():
-        candidate = destination.with_name(f"{destination.name}.handbrake.{counter}.log")
-        counter += 1
-    candidate.write_text("".join(lines), encoding="utf-8")
-    return candidate
 
 
 @app.command(name="run")
@@ -1468,7 +2416,17 @@ def run_batch(
         "--replace-source/--keep-source",
         help="Replace each source only when its validated HEVC output is smaller.",
     ),
+    stop_when_larger: bool = typer.Option(
+        False,
+        help="Stop replacement encodes when the partial output reaches source size.",
+    ),
     include_hevc: bool = typer.Option(False, help="Reprocess files already encoded as HEVC."),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-blocked",
+        "--retry-failed",
+        help="Retry remembered non-candidates.",
+    ),
     allow_no_audio: bool = typer.Option(
         False, help="Allow output without audio even when source has audio."
     ),
@@ -1503,9 +2461,7 @@ def run_batch(
         unknown_subtitles = str(
             prefer_profile(profile_settings, "unknown_subtitles", unknown_subtitles, "ask")
         )
-        format_preset = prefer_profile(
-            profile_settings, "format_preset", format_preset, None
-        )
+        format_preset = prefer_profile(profile_settings, "format_preset", format_preset, None)
         format_preset = str(format_preset) if format_preset else None
         quality = float(prefer_profile(profile_settings, "quality", quality, 18.0))
         preset = str(prefer_profile(profile_settings, "preset", preset, "slow"))
@@ -1521,6 +2477,9 @@ def run_batch(
     ffprobe_executable = find_executable("ffprobe", ffprobe)
     if not executable or not ffprobe_executable:
         console.print("[red]Error:[/] HandBrakeCLI or ffprobe not found. Run `brakesmith doctor`.")
+        raise typer.Exit(2)
+    if stop_when_larger and not replace_source:
+        console.print("[red]Error:[/] --stop-when-larger requires --replace-source.")
         raise typer.Exit(2)
     if invalid_existing not in {"fail", "quarantine"}:
         console.print("[red]Error:[/] --invalid-existing must be fail or quarantine")
@@ -1541,25 +2500,52 @@ def run_batch(
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
+    policy_hash = policy_digest(
+        {
+            "format": vars(format_choice),
+            "format_values": FORMAT_PRESETS.get(format_choice.name),
+            "audio": audio,
+            "subtitles": subtitles,
+            "unknown_audio": unknown_audio,
+            "unknown_subtitles": unknown_subtitles,
+            "keep_commentary": keep_commentary,
+            "forced_subtitles_only": forced_subtitles_only,
+            "exclude_titles": exclude_titles,
+            "keep_original": keep_original,
+            "original_language": original_language,
+            "tune": tune,
+            "level": encoder_level,
+            "crop": crop,
+            "deinterlace": deinterlace,
+            "lossless": lossless,
+            "replace_source": replace_source,
+            "output_directory": output_directory,
+            "allow_no_audio": allow_no_audio,
+        }
+    )
     try:
-        items = limit_proposed_files(
-            [
-                m
-                for m in inspect(
-                    directory,
-                    depth,
-                    ffprobe,
-                    extensions,
-                    workers,
-                    probe_timeout,
-                    cache,
-                    use_cache,
-                )
-                if m.should_convert or include_hevc
-            ],
-            max_files,
+        candidates = [
+            item
+            for item in inspect(
+                directory,
+                depth,
+                ffprobe,
+                extensions,
+                workers,
+                probe_timeout,
+                cache,
+                use_cache,
+                retry_blocked=retry_failed,
+            )
+            if item.should_convert or include_hevc
+        ]
+        failure_store = FailureStore()
+        candidates = exclude_remembered_failures(
+            candidates, failure_store, retry_failed, policy_hash
         )
+        items = limit_proposed_files(candidates, max_files)
         if not items:
+            console.print("No conversion candidates.")
             return
         (
             audio_languages,
@@ -1710,6 +2696,9 @@ def run_batch(
                 partial = destination.with_name(destination.name + ".part")
                 if destination.exists():
                     try:
+                        require_matching_existing_output(
+                            failure_store, item.path, destination, policy_hash
+                        )
                         validate_output(
                             destination,
                             ffprobe_executable,
@@ -1725,6 +2714,16 @@ def run_batch(
                         else:
                             failures += 1
                             console.print(f"[red]Failed:[/] Existing output is invalid: {error}")
+                            try:
+                                failure_store.record(
+                                    item.path,
+                                    "existing-output",
+                                    str(error),
+                                    policy_hash=policy_hash,
+                                    duration=item.duration,
+                                )
+                            except BrakeSmithError as registry_error:
+                                console.print(f"[red]Warning:[/] {registry_error}")
                             summary_entries.append(
                                 {
                                     "source": str(item.path),
@@ -1746,6 +2745,16 @@ def run_batch(
                             except BrakeSmithError as error:
                                 failures += 1
                                 console.print(f"[red]Failed:[/] {error}")
+                                try:
+                                    failure_store.record(
+                                        item.path,
+                                        "source-delete",
+                                        str(error),
+                                        policy_hash=policy_hash,
+                                        duration=item.duration,
+                                    )
+                                except BrakeSmithError as registry_error:
+                                    console.print(f"[red]Warning:[/] {registry_error}")
                                 summary_entries.append(
                                     {
                                         "source": str(item.path),
@@ -1761,6 +2770,14 @@ def run_batch(
                                         f"[yellow]Kept source:[/] existing output was not smaller "
                                         f"({discarded_size} >= {snapshots[item.path].size} bytes)"
                                     )
+                                    remember_not_smaller(
+                                        failure_store,
+                                        item.path,
+                                        snapshots[item.path].size,
+                                        discarded_size,
+                                        policy_hash=policy_hash,
+                                        duration=item.duration,
+                                    )
                                     summary_entries.append(
                                         {
                                             "source": str(item.path),
@@ -1772,6 +2789,17 @@ def run_batch(
                                     )
                                 else:
                                     completed += 1
+                                    remember_success(
+                                        failure_store,
+                                        item.path,
+                                        destination,
+                                        policy_hash,
+                                        "validated-existing",
+                                        item.duration,
+                                        snapshots[item.path].size,
+                                        snapshots[item.path].modified_ns,
+                                        True,
+                                    )
                                     console.print(
                                         f"[green]Replaced:[/] {item.path} → {destination}"
                                     )
@@ -1784,6 +2812,17 @@ def run_batch(
                                         }
                                     )
                         else:
+                            remember_success(
+                                failure_store,
+                                item.path,
+                                destination,
+                                policy_hash,
+                                "validated-existing",
+                                item.duration,
+                                snapshots[item.path].size,
+                                snapshots[item.path].modified_ns,
+                                False,
+                            )
                             console.print(f"[yellow]Skip:[/] Valid output exists: {destination}")
                             skipped += 1
                             summary_entries.append(
@@ -1812,6 +2851,16 @@ def run_batch(
                         failures += 1
                         message = f"Stale {classification} partial requires --stale-partial quarantine or delete: {partial}"
                         console.print(f"[red]Failed:[/] {message}")
+                        try:
+                            failure_store.record(
+                                item.path,
+                                "stale-partial",
+                                message,
+                                policy_hash=policy_hash,
+                                duration=item.duration,
+                            )
+                        except BrakeSmithError as registry_error:
+                            console.print(f"[red]Warning:[/] {registry_error}")
                         summary_entries.append(
                             {
                                 "source": str(item.path),
@@ -1857,7 +2906,8 @@ def run_batch(
                     formats[item.path].library_audio,
                 )
                 process: Optional[subprocess.Popen[str]] = None
-                diagnostics: list[str] = []
+                diagnostics: deque[str] = deque(maxlen=500)
+                failure_type = "encode"
                 try:
                     process = subprocess.Popen(
                         command,
@@ -1867,6 +2917,7 @@ def run_batch(
                         errors="replace",
                     )
                     assert process.stdout is not None
+                    early_size: Optional[int] = None
                     for line in process.stdout:
                         diagnostics.append(line)
                         match = progress_pattern.search(line)
@@ -1877,9 +2928,54 @@ def run_batch(
                                 total_task,
                                 completed=(file_number - 1) + percent / 100,
                             )
+                        if replace_source and stop_when_larger:
+                            early_size = partial_reached_source_size(
+                                partial, snapshots[item.path].size
+                            )
+                            if early_size is not None:
+                                terminate_process(process)
+                                break
+                    if early_size is not None:
+                        cleanup_error = remember_oversized_partial(
+                            failure_store,
+                            item.path,
+                            partial,
+                            snapshots[item.path].size,
+                            early_size,
+                            diagnostics,
+                            policy_hash,
+                            item.duration,
+                        )
+                        if cleanup_error:
+                            failures += 1
+                            console.print(f"[red]Failed:[/] {cleanup_error}")
+                        else:
+                            skipped += 1
+                            console.print(
+                                f"[yellow]Stopped early:[/] partial reached source size "
+                                f"({early_size} >= {snapshots[item.path].size} bytes): {item.path}"
+                            )
+                        summary_entries.append(
+                            {
+                                "source": str(item.path),
+                                "output": None,
+                                "status": (
+                                    "failed-stale-partial"
+                                    if cleanup_error
+                                    else "kept-source-not-smaller"
+                                ),
+                                "early_stop": True,
+                                "source_bytes": snapshots[item.path].size,
+                                "output_bytes": early_size,
+                                "cleanup_error": cleanup_error,
+                            }
+                        )
+                        progress.update(file_task, completed=100)
+                        continue
                     if process.wait() != 0:
                         raise BrakeSmithError(f"HandBrake failed for {item.path.name}")
                     ensure_source_unchanged(snapshots[item.path])
+                    failure_type = "validation"
                     validate_output(
                         partial,
                         ffprobe_executable,
@@ -1899,6 +2995,15 @@ def run_batch(
                             f"[yellow]Kept source:[/] output was not smaller "
                             f"({discarded_size} >= {snapshots[item.path].size} bytes): {item.path}"
                         )
+                        remember_not_smaller(
+                            failure_store,
+                            item.path,
+                            snapshots[item.path].size,
+                            discarded_size,
+                            diagnostics,
+                            policy_hash,
+                            item.duration,
+                        )
                         summary_entries.append(
                             {
                                 "source": str(item.path),
@@ -1910,10 +3015,23 @@ def run_batch(
                         )
                         progress.update(file_task, completed=100)
                         continue
+                    failure_type = "publish"
                     partial.replace(destination)
                     if replace_source:
+                        failure_type = "source-delete"
                         delete_replaced_source(item.path, destination)
                     completed += 1
+                    remember_success(
+                        failure_store,
+                        item.path,
+                        destination,
+                        policy_hash,
+                        "published",
+                        item.duration,
+                        snapshots[item.path].size,
+                        snapshots[item.path].modified_ns,
+                        replace_source,
+                    )
                     summary_entries.append(
                         {
                             "source": str(item.path),
@@ -1932,6 +3050,18 @@ def run_batch(
                     )
                     if cleanup_error:
                         console.print(f"[red]Warning:[/] {cleanup_error}")
+                    try:
+                        failure_store.record(
+                            item.path,
+                            "cancelled",
+                            "Conversion cancelled",
+                            diagnostics,
+                            cleanup_error,
+                            policy_hash,
+                            item.duration,
+                        )
+                    except BrakeSmithError as registry_error:
+                        console.print(f"[red]Warning:[/] {registry_error}")
                     summary_entries.append(
                         {
                             "source": str(item.path),
@@ -1947,31 +3077,31 @@ def run_batch(
                     raise typer.Exit(130)
                 except Exception as error:  # noqa: BLE001 - cleanup must cover filesystem failures
                     terminate_process(process)
-                    quarantined: Optional[Path] = None
-                    if partial.exists():
-                        try:
-                            quarantined = quarantine_file(partial, "invalid")
-                        except BrakeSmithError:
-                            quarantined = None
-                    cleanup_error = cleanup_partial(partial) if partial.exists() else None
                     failures += 1
                     console.print(f"[red]Failed:[/] {error}")
                     log_path: Optional[Path] = None
-                    if diagnostics:
-                        try:
-                            log_path = write_failure_log(destination, diagnostics)
-                            console.print(f"[yellow]HandBrake log:[/] {log_path}")
-                        except OSError as log_error:
-                            console.print(
-                                f"[red]Warning:[/] Cannot save HandBrake log: {log_error}"
-                            )
+                    try:
+                        log_path, cleanup_error = remember_failure(
+                            failure_store,
+                            item.path,
+                            partial,
+                            failure_type,
+                            str(error),
+                            diagnostics,
+                            policy_hash,
+                            item.duration,
+                        )
+                        console.print(f"[yellow]Failure log:[/] {log_path}")
+                    except BrakeSmithError as registry_error:
+                        cleanup_error = cleanup_partial(partial)
+                        console.print(f"[red]Warning:[/] {registry_error}")
                     summary_entries.append(
                         {
                             "source": str(item.path),
                             "output": str(destination),
                             "status": "failed",
+                            "type": failure_type,
                             "error": str(error),
-                            "quarantined": str(quarantined) if quarantined else None,
                             "log": str(log_path) if log_path else None,
                         }
                     )

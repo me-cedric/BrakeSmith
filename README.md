@@ -37,6 +37,11 @@ It is review-first. Output is written to a temporary file and published only aft
 - JSON scan output for automation.
 - Complete conversion-candidate exports in JSON, CSV, or plain text.
 - Concurrent metadata probing with local change-aware cache and timeouts.
+- Persistent non-candidate registry prevents unchanged failed or non-beneficial files from being selected repeatedly.
+- Successful-output identity and transcode-policy tracking prevent completed keep-source jobs from being proposed again.
+- Four-state library status: ready, success/not required, blocked, and missing/stale.
+- Bounded per-file attempt history and centralized diagnostic logs.
+- Quick header checks and full frame-decoding health checks.
 - Immutable reviewed plans with exact source identity and collision checks.
 - Atomic execution journals, restart/resume, failed-only retry, and stop controls.
 - Output validation before publication: codec, duration, tracks, chapters, and readability.
@@ -51,7 +56,7 @@ It is review-first. Output is written to a temporary file and published only aft
 
 - Source files remain untouched unless `--replace-source` is explicit.
 - Final output appears only after a successful encode.
-- Partial output uses `.mkv.part`; cancellation cleans it and invalid output is quarantined.
+- Partial output uses `.mkv.part`; cancellation and conversion failure delete it.
 - Existing destination files are validated and never silently overwritten.
 - Source size, modification time, device, and inode are rechecked before and after encoding.
 - Output appears under its final name only after independent ffprobe validation.
@@ -60,12 +65,14 @@ It is review-first. Output is written to a temporary file and published only aft
 - `--non-interactive` controls prompts separately from `--yes` confirmation bypass.
 - Replace mode publishes and validates the new file before deleting its source. A deletion failure keeps both files and reports failure.
 - Replace mode compares exact byte sizes after validation. Equal/larger output is deleted and source is retained.
+- Optional `--stop-when-larger` ends a replacement encode when its partial output reaches source size.
 
 ## Requirements
 
 - Python 3.9+
 - [HandBrakeCLI](https://handbrake.fr/downloads2.php)
 - `ffprobe` from [FFmpeg](https://ffmpeg.org/download.html)
+- `ffmpeg` for optional full health checks
 
 macOS with Homebrew:
 
@@ -108,7 +115,7 @@ With pipx:
 pipx install git+https://github.com/me-cedric/BrakeSmith.git
 ```
 
-Standalone executables are available as CI artifacts for macOS, Windows, and Linux. They bundle BrakeSmith and Python; HandBrakeCLI and ffprobe remain external requirements.
+Standalone executables are available as CI artifacts for macOS, Windows, and Linux. They bundle BrakeSmith and Python. HandBrakeCLI and ffprobe remain external requirements. Full health checks also need ffmpeg.
 
 From source:
 
@@ -178,15 +185,25 @@ brakesmith run "/path/to/videos" --audio fra,eng --keep-original --original-lang
 
 | Command | Purpose |
 | --- | --- |
-| `brakesmith doctor` | Check HandBrakeCLI and ffprobe. |
+| `brakesmith doctor` | Check required tools and optional full-health support. |
 | `brakesmith scan [DIRECTORY]` | Inventory all supported videos. Defaults to `.`. |
 | `brakesmith scan --json` | Emit machine-readable inventory. |
-| `brakesmith candidates [DIRECTORY]` | Show only videos not already encoded as HEVC. |
+| `brakesmith status [DIRECTORY]` | Show ready, successful, blocked, and stale library files. |
+| `brakesmith history [DIRECTORY]` | Show recent outcomes for each file. |
+| `brakesmith retry FILE...` | Release selected blocked files for the next run. |
+| `brakesmith health [DIRECTORY] --quick` | Check file headers and stream metadata. |
+| `brakesmith health [DIRECTORY] --full` | Decode all video and audio frames. |
+| `brakesmith candidates [DIRECTORY]` | Show unblocked videos not already encoded as HEVC. |
 | `brakesmith candidates --output candidates.csv` | Save a complete reviewable conversion list. |
 | `brakesmith plan --output batch.json` | Create a sealed, non-destructive execution plan. |
 | `brakesmith dry-run --output batch.json` | Alias for `plan`. |
 | `brakesmith execute batch.json` | Execute or resume a plan using atomic state. |
 | `brakesmith run [DIRECTORY]` | Review, reconcile, and convert a batch. |
+| `brakesmith failures list` | List remembered failed files and log paths. |
+| `brakesmith failures clear` | Clear failure records and centralized logs. |
+| `brakesmith failures forget FILE...` | Propose selected files again on later runs. |
+| `brakesmith failures prune` | Remove stale records and orphan logs. |
+| `brakesmith failures path` | Show failure registry and log directories. |
 | `brakesmith --version` | Print installed version. |
 
 Depth examples:
@@ -246,14 +263,85 @@ Execute or resume it:
 ```sh
 brakesmith execute movie-batch.json
 brakesmith execute movie-batch.json --stop-after-current
-brakesmith execute movie-batch.json --retry-failed --max-failures 0
+brakesmith execute movie-batch.json --retry-blocked --max-failures 0
 ```
 
 Plans include a digest and exact source identity. Editing a plan, changing a source, or using mismatched state is refused. State is saved beside the plan after every file.
 
 Add `--replace-source` while creating the plan to seal immediate per-file replacement into it.
 
+Add `--stop-when-larger` to stop wasting encode time after a partial output reaches the source size. The guard uses a known byte count. It does not estimate the final size.
+
 Exit codes: `0` success, `1` batch failure, `2` configuration/preflight failure, `130` cancellation.
+
+## Library state and history
+
+BrakeSmith stores successful, blocked, failed, and cancelled outcomes in `$XDG_STATE_HOME/brakesmith`, or `~/.local/state/brakesmith` when `XDG_STATE_HOME` is unset. Windows uses `%LOCALAPPDATA%\brakesmith`. Media folders receive no state files or logs.
+
+Inspect current library state and recent attempts:
+
+```sh
+brakesmith status /Volumes/Media
+brakesmith status /Volumes/Media --json
+brakesmith history /Volumes/Media
+brakesmith history /Volumes/Media --type not-smaller --json
+```
+
+Successful records contain source identity, output identity, and a transcode-policy hash. A changed source, changed output, or changed CLI policy becomes eligible for evaluation again. Each source keeps its latest 20 lightweight attempt records. Only the latest diagnostic log is retained for each source.
+
+Metadata probe failures remain blocked to avoid repeated work. A changed ffprobe path or timeout makes them eligible again. Use `retry` or `--retry-blocked` for an immediate retry.
+
+Release selected failures without deleting their history:
+
+```sh
+brakesmith retry "/Volumes/Media/movie.mkv"
+brakesmith retry --type not-smaller
+brakesmith retry --root /Volumes/Media --type encode
+```
+
+The next `run` or `plan` can select released files. Override all matching records for one run with:
+
+```sh
+brakesmith run /Volumes/Media --retry-blocked
+```
+
+`--retry-failed` remains an alias.
+
+`brakesmith candidates` also excludes remembered sources by default. Pass `--include-blocked` to include them in an export or review table.
+
+Inspect or clear failures:
+
+```sh
+brakesmith failures list
+brakesmith failures list --type not-smaller
+brakesmith failures forget "/Volumes/Media/movie.mkv"
+brakesmith failures prune
+brakesmith failures clear --type not-smaller
+brakesmith failures clear --logs-only
+brakesmith failures clear --keep-logs
+brakesmith failures path
+```
+
+Types identify the result or failure stage: `cancelled`, `probe`, `not-smaller`, `source`, `encode`, `validation`, `publish`, `source-delete`, `existing-output`, or `stale-partial`. `forget` deletes selected state. `prune` removes records for missing or changed files plus orphan logs. Clearing failure records does not delete successful history. `--logs-only` preserves skip records; `--keep-logs` clears records but retains diagnostic files until a later prune.
+
+Failed partial outputs are deleted. One safety exception remains: if source deletion fails after a new output was fully validated and published, BrakeSmith keeps both files and records a `source-delete` failure.
+
+## Health checks
+
+Quick mode reads headers and stream metadata with ffprobe:
+
+```sh
+brakesmith health /Volumes/Media --quick
+```
+
+Full mode decodes all video and audio frames with ffmpeg. It can take as long as playback:
+
+```sh
+brakesmith health /Volumes/Media --full
+brakesmith health /Volumes/Media --full --timeout 14400 --json
+```
+
+Health checks never modify media. Exit code `1` means one or more files failed the check.
 
 ## Profiles
 
