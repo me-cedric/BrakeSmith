@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BrakeSmith Desktop",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "identifier": "io.github.me-cedric.brakesmith",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -29,6 +29,13 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "externalBin": ["binaries/brakesmith"],
     "shortDescription": "Safety-first H.265 library transcoding",
     "longDescription": "Optional cross-platform desktop interface for BrakeSmith CLI.",

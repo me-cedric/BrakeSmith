@@ -1,6 +1,6 @@
 [package]
 name = "brakesmith-desktop"
-version = "0.5.1"
+version = "0.6.0"
 description = "Optional desktop interface for BrakeSmith CLI"
 authors = ["Cedric Meyer"]
 edition = "2021"
