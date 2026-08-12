@@ -4,10 +4,56 @@ from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
-from brakesmith import cli
+from brakesmith import bridge as machine_bridge
+from brakesmith import cli, core
 from brakesmith.core import MediaFile, Track
+from brakesmith.plans import write_plan
 
 runner = CliRunner()
+
+
+def test_media_tools_use_homebrew_fallbacks(monkeypatch):
+    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: str(path) == "/opt/homebrew/bin/ffprobe",
+    )
+
+    assert core.find_executable("ffprobe") == "/opt/homebrew/bin/ffprobe"
+
+
+def test_bridge_failed_json_command_keeps_cli_diagnostic():
+    try:
+        machine_bridge.run_child(["not-a-real-command"], True, {0})
+    except machine_bridge.BridgeError as error:
+        assert "invalid JSON" not in str(error)
+        assert "No such command" in str(error)
+    else:
+        raise AssertionError("invalid command was accepted")
+
+
+def test_cancel_marker_is_detected(tmp_path: Path, monkeypatch):
+    marker = tmp_path / "stop"
+    monkeypatch.setenv("BRAKESMITH_CANCEL_FILE", str(marker))
+    assert not cli.cancellation_requested()
+    marker.touch()
+    assert cli.cancellation_requested()
+
+
+def test_execute_plan_honors_desktop_cancel_marker(tmp_path: Path, monkeypatch):
+    marker = tmp_path / "stop"
+    marker.touch()
+    ffprobe = tmp_path / "ffprobe"
+    ffprobe.touch()
+    plan = tmp_path / "plan.json"
+    write_plan(plan, {"ffprobe": str(ffprobe), "items": [{"duration": 1}]})
+    monkeypatch.setenv("BRAKESMITH_CANCEL_FILE", str(marker))
+
+    result = runner.invoke(cli.app, ["execute", str(plan)])
+
+    assert result.exit_code == 130
+    assert "Cancelled" in result.output
 
 
 def test_delete_replaced_source_keeps_validated_output(tmp_path: Path):
@@ -223,6 +269,154 @@ def test_health_cli_supports_json_quick_check(tmp_path: Path, monkeypatch):
 
     assert result.exit_code == 0
     assert json.loads(result.stdout)[0]["status"] == "healthy"
+
+
+def test_doctor_json_reports_optional_and_required_tools(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "find_executable",
+        lambda name, explicit=None: None if name == "ffmpeg" else f"/tools/{name}",
+    )
+
+    result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["healthy"] is True
+    assert payload["tools"]["handbrake"] == "/tools/HandBrakeCLI"
+    assert payload["tools"]["ffmpeg"] is None
+
+
+def test_plan_uses_exact_source_selection(tmp_path: Path, monkeypatch):
+    first = tmp_path / "first.mkv"
+    second = tmp_path / "second.mkv"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    monkeypatch.setattr(
+        cli,
+        "inspect",
+        lambda *args, **kwargs: [
+            MediaFile(first, "h264", 10, first.stat().st_size),
+            MediaFile(second, "h264", 20, second.stat().st_size),
+        ],
+    )
+    monkeypatch.setattr(cli, "find_executable", lambda name, explicit=None: f"/tools/{name}")
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps([str(second)]))
+    plan = tmp_path / "queue.json"
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "plan",
+            str(tmp_path),
+            "--output",
+            str(plan),
+            "--selection",
+            str(selection),
+            "--format-preset",
+            "custom",
+            "--unknown-audio",
+            "drop",
+            "--unknown-subtitles",
+            "drop",
+            "--non-interactive",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [item["source"] for item in json.loads(plan.read_text())["items"]] == [str(second)]
+
+
+def test_plan_can_explicitly_reprocess_selected_hevc(tmp_path: Path, monkeypatch):
+    source = tmp_path / "already-hevc.mkv"
+    source.write_bytes(b"source")
+    monkeypatch.setattr(
+        cli,
+        "inspect",
+        lambda *args, **kwargs: [MediaFile(source, "hevc", 10, source.stat().st_size)],
+    )
+    monkeypatch.setattr(cli, "find_executable", lambda name, explicit=None: f"/tools/{name}")
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps([str(source)]))
+    plan = tmp_path / "queue.json"
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "plan",
+            str(tmp_path),
+            "--output",
+            str(plan),
+            "--selection",
+            str(selection),
+            "--include-hevc",
+            "--format-preset",
+            "custom",
+            "--unknown-audio",
+            "drop",
+            "--unknown-subtitles",
+            "drop",
+            "--non-interactive",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(plan.read_text())["items"][0]["source"] == str(source)
+
+
+def test_exact_selection_rejects_paths_outside_library(tmp_path: Path):
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps([str(tmp_path.parent / "outside.mkv")]))
+
+    try:
+        cli.load_exact_sources(selection, tmp_path)
+    except cli.BrakeSmithError as error:
+        assert "outside the library" in str(error)
+    else:
+        raise AssertionError("outside selection was accepted")
+
+
+def test_machine_bridge_capabilities_are_versioned():
+    result = runner.invoke(
+        cli.app,
+        ["bridge", "--protocol", "1"],
+        input=json.dumps({"protocol": 1, "method": "capabilities", "params": {}}),
+    )
+
+    assert result.exit_code == 0, result.output
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert events[0]["event"] == "accepted"
+    assert events[1]["data"]["protocol"] == machine_bridge.PROTOCOL_VERSION
+    assert events[-1] == {"protocol": 1, "event": "finished", "ok": True, "exit_code": 0}
+
+
+def test_machine_bridge_only_accepts_known_methods():
+    result = runner.invoke(
+        cli.app,
+        ["bridge"],
+        input=json.dumps({"method": "shell.run", "params": {"command": "anything"}}),
+    )
+
+    assert result.exit_code == 2
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert events[-2]["event"] == "error"
+    assert "Unknown method" in events[-2]["message"]
+
+
+def test_machine_bridge_reads_only_valid_sealed_plans(tmp_path: Path):
+    plan = tmp_path / "plan.json"
+    write_plan(plan, {"items": [], "root": str(tmp_path)})
+
+    result = runner.invoke(
+        cli.app,
+        ["bridge"],
+        input=json.dumps({"method": "plan.read", "params": {"plan_file": str(plan)}}),
+    )
+
+    assert result.exit_code == 0, result.output
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert events[-2]["data"]["digest"] == json.loads(plan.read_text())["digest"]
 
 
 def test_probe_failure_is_blocked_until_retry(tmp_path: Path, monkeypatch):

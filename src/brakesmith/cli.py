@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import re
 import signal
 import subprocess
@@ -72,8 +73,25 @@ app = typer.Typer(
 )
 failures_app = typer.Typer(help="Manage files blocked after failed or unhelpful conversions.")
 app.add_typer(failures_app, name="failures")
-console = Console()
-error_console = Console(stderr=True)
+machine_width = 1000 if os.environ.get("BRAKESMITH_EVENTS") == "1" else None
+console = Console(width=machine_width)
+error_console = Console(stderr=True, width=machine_width)
+MACHINE_EVENT_PREFIX = "BRAKESMITH_EVENT "
+
+
+def emit_machine_event(event: str, **payload: object) -> None:
+    """Emit one structured progress event when a machine client requested it."""
+    if os.environ.get("BRAKESMITH_EVENTS") != "1":
+        return
+    typer.echo(
+        f"{MACHINE_EVENT_PREFIX}{json.dumps({'event': event, **payload}, default=str)}",
+        err=True,
+    )
+
+
+def cancellation_requested() -> bool:
+    marker = os.environ.get("BRAKESMITH_CANCEL_FILE")
+    return bool(marker and Path(marker).is_file())
 
 
 def version_callback(value: bool) -> None:
@@ -89,6 +107,16 @@ def main(
     ),
 ) -> None:
     """Safety-first batch H.265 transcoding."""
+
+
+@app.command(hidden=True)
+def bridge(
+    protocol: int = typer.Option(1, help="Machine protocol version."),
+) -> None:
+    """Serve one versioned desktop request from standard input."""
+    from .bridge import run_bridge
+
+    run_bridge(protocol)
 
 
 def inspect(
@@ -121,6 +149,10 @@ def inspect(
                 discovery_task,
                 description=f"Discovering videos · {directories} folders · {files} found",
             )
+            if directories == 1 or directories % 20 == 0:
+                emit_machine_event(
+                    "progress", phase="discover", directories=directories, discovered=files
+                )
 
         paths = discover(
             root,
@@ -134,6 +166,13 @@ def inspect(
             description=f"Discovered {len(paths)} videos",
             total=1,
             completed=1,
+        )
+        emit_machine_event(
+            "progress",
+            phase="discover",
+            directories=None,
+            discovered=len(paths),
+            finished=True,
         )
     media: list[MediaFile] = []
     errors = list(traversal_errors)
@@ -177,12 +216,13 @@ def inspect(
         max_workers=max(1, workers), thread_name_prefix="brakesmith-probe"
     )
     futures = {executor.submit(probe, path, ffprobe, probe_timeout): path for path in pending}
+    analyzed = cache_hits + blocked_probes
     try:
         with progress:
             task = progress.add_task(
                 f"Analyzing metadata ({cache_hits} cached)",
                 total=len(paths),
-                completed=cache_hits,
+                completed=analyzed,
             )
             for future in as_completed(futures):
                 path = futures[future]
@@ -201,7 +241,15 @@ def inspect(
                         outcome_store.record(path, "probe", str(error), policy_hash=probe_policy)
                     except BrakeSmithError as registry_error:
                         errors.append(str(registry_error))
+                analyzed += 1
                 progress.advance(task)
+                emit_machine_event(
+                    "progress",
+                    phase="probe",
+                    completed=analyzed,
+                    total=len(paths),
+                    source=str(path),
+                )
     except KeyboardInterrupt:
         for future in futures:
             future.cancel()
@@ -220,6 +268,7 @@ def inspect(
         except BrakeSmithError as error:
             errors.append(str(error))
     for error in errors:
+        emit_machine_event("warning", phase="scan", message=error)
         error_console.print(f"[yellow]Warning:[/] {error}")
     error_console.print(
         f"[dim]Inspected {len(media)}/{len(paths)} files; {cache_hits} cache hits; "
@@ -578,22 +627,40 @@ def doctor(
     handbrake: Optional[Path] = typer.Option(None, help="Path to HandBrakeCLI."),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
     ffmpeg: Optional[Path] = typer.Option(None, help="Path to ffmpeg."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
 ) -> None:
     """Check required tools without changing files."""
     required = {
         "HandBrakeCLI": find_executable("HandBrakeCLI", handbrake),
         "ffprobe": find_executable("ffprobe", ffprobe),
     }
-    for name, path in required.items():
-        console.print(f"[green]✓[/] {name}: {path}" if path else f"[red]✗[/] {name}: not found")
     optional_ffmpeg = find_executable("ffmpeg", ffmpeg)
-    console.print(
-        f"[green]✓[/] ffmpeg (full health checks): {optional_ffmpeg}"
-        if optional_ffmpeg
-        else "[yellow]○[/] ffmpeg: optional; full health checks unavailable"
-    )
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "version": __version__,
+                    "healthy": all(required.values()),
+                    "tools": {
+                        "handbrake": required["HandBrakeCLI"],
+                        "ffprobe": required["ffprobe"],
+                        "ffmpeg": optional_ffmpeg,
+                    },
+                },
+                indent=2,
+            )
+        )
+    else:
+        for name, path in required.items():
+            console.print(f"[green]✓[/] {name}: {path}" if path else f"[red]✗[/] {name}: not found")
+        console.print(
+            f"[green]✓[/] ffmpeg (full health checks): {optional_ffmpeg}"
+            if optional_ffmpeg
+            else "[yellow]○[/] ffmpeg: optional; full health checks unavailable"
+        )
     if not all(required.values()):
-        console.print("Install HandBrakeCLI and ffprobe, or pass explicit paths.")
+        if not json_output:
+            console.print("Install HandBrakeCLI and ffprobe, or pass explicit paths.")
         raise typer.Exit(1)
 
 
@@ -654,6 +721,9 @@ def health_check(
     timeout: float = typer.Option(0, min=0, help="Seconds per file; 0 disables timeout."),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
     extensions: str = typer.Option("", help="Extra comma-separated file extensions."),
+    selection: Optional[Path] = typer.Option(
+        None, exists=True, dir_okay=False, help="JSON list of exact source paths to check."
+    ),
     ffprobe: Optional[Path] = typer.Option(None, help="Path to ffprobe."),
     ffmpeg: Optional[Path] = typer.Option(None, help="Path to ffmpeg."),
 ) -> None:
@@ -671,6 +741,11 @@ def health_check(
         extensions.split(",") if extensions else (),
         errors=traversal_errors,
     )
+    try:
+        paths = select_exact_paths(paths, directory, selection)
+    except BrakeSmithError as error:
+        console.print(f"[red]Error:[/] {error}")
+        raise typer.Exit(2)
     results: list[dict[str, object]] = []
     with Progress(
         TextColumn("{task.description}"),
@@ -683,10 +758,24 @@ def health_check(
         task = progress.add_task("Checking media health", total=len(paths))
         try:
             for path in paths:
+                emit_machine_event(
+                    "item",
+                    phase="health",
+                    source=str(path),
+                    completed=len(results),
+                    total=len(paths),
+                )
                 results.append(
                     check_media_health(path, full, ffprobe_executable, ffmpeg_executable, timeout)
                 )
                 progress.advance(task)
+                emit_machine_event(
+                    "progress",
+                    phase="health",
+                    source=str(path),
+                    completed=len(results),
+                    total=len(paths),
+                )
         except KeyboardInterrupt:
             error_console.print("[yellow]Health check cancelled.[/]")
             raise typer.Exit(130)
@@ -718,6 +807,7 @@ def health_check(
 @failures_app.command(name="list")
 def list_failures(
     kind: Optional[str] = typer.Option(None, "--type", help="Filter by failure type."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
 ) -> None:
     """List remembered source files that normal runs will not propose."""
     if kind and kind not in FAILURE_TYPES:
@@ -729,6 +819,13 @@ def list_failures(
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
+    if json_output:
+        payload = []
+        for record in records:
+            source = Path(str(record["source"]))
+            payload.append({**record, "active": bool(store.active(source))})
+        typer.echo(json.dumps(payload, indent=2))
+        return
     if not records:
         console.print("No remembered non-candidates.")
         return
@@ -1242,6 +1339,64 @@ def limit_proposed_files(items: list[MediaFile], maximum: Optional[int]) -> list
     return items[:maximum]
 
 
+def load_exact_sources(selection: Optional[Path], root: Path) -> list[Path]:
+    """Load and validate a stable, ordered source selection."""
+    if selection is None:
+        return []
+    try:
+        payload = json.loads(selection.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BrakeSmithError(f"Cannot read source selection {selection}: {error}") from error
+    if isinstance(payload, dict):
+        payload = payload.get("sources")
+    if not isinstance(payload, list) or not all(isinstance(value, str) for value in payload):
+        raise BrakeSmithError("Source selection must be a JSON list of paths")
+    selected: list[Path] = []
+    seen: set[str] = set()
+    for value in payload:
+        source = Path(value).expanduser()
+        if not source.is_absolute():
+            source = root / source
+        source = source.resolve()
+        if not path_is_under(source, root):
+            raise BrakeSmithError(f"Selected source is outside the library: {source}")
+        key = os.path.normcase(str(source))
+        if key not in seen:
+            seen.add(key)
+            selected.append(source)
+    if not selected:
+        raise BrakeSmithError("Source selection is empty")
+    return selected
+
+
+def select_exact_paths(paths: list[Path], root: Path, selection: Optional[Path]) -> list[Path]:
+    requested = load_exact_sources(selection, root)
+    if not requested:
+        return paths
+    available = {os.path.normcase(str(path.resolve())): path for path in paths}
+    missing = [path for path in requested if os.path.normcase(str(path)) not in available]
+    if missing:
+        names = ", ".join(str(path) for path in missing[:3])
+        suffix = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+        raise BrakeSmithError(f"Selected source is not available: {names}{suffix}")
+    return [available[os.path.normcase(str(path))] for path in requested]
+
+
+def select_exact_media(
+    items: list[MediaFile], root: Path, selection: Optional[Path]
+) -> list[MediaFile]:
+    requested = load_exact_sources(selection, root)
+    if not requested:
+        return items
+    available = {os.path.normcase(str(item.path.resolve())): item for item in items}
+    missing = [path for path in requested if os.path.normcase(str(path)) not in available]
+    if missing:
+        names = ", ".join(str(path) for path in missing[:3])
+        suffix = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+        raise BrakeSmithError(f"Selected source is not an eligible candidate: {names}{suffix}")
+    return [available[os.path.normcase(str(path))] for path in requested]
+
+
 def exclude_remembered_failures(
     items: list[MediaFile],
     store: FailureStore,
@@ -1387,6 +1542,9 @@ def plan_batch(
     max_files: Optional[int] = typer.Option(
         None, min=1, help="Maximum conversion candidates; interactive runs ask when omitted."
     ),
+    selection: Optional[Path] = typer.Option(
+        None, exists=True, dir_okay=False, help="JSON list of exact source paths to include."
+    ),
     audio: str = typer.Option("eng,fra", help="Audio languages to keep."),
     subtitles: str = typer.Option("eng,fra", help="Subtitle languages to keep."),
     unknown_audio: str = typer.Option("ask", help="Unlabelled audio: ask, keep, or drop."),
@@ -1420,6 +1578,7 @@ def plan_batch(
         False,
         help="Stop replacement encodes when the partial output reaches source size.",
     ),
+    include_hevc: bool = typer.Option(False, help="Reprocess files already encoded as HEVC."),
     overrides: Optional[Path] = typer.Option(
         None, exists=True, dir_okay=False, help="Per-source audio_tracks/subtitle_tracks JSON."
     ),
@@ -1512,6 +1671,7 @@ def plan_batch(
             "deinterlace": deinterlace,
             "lossless": lossless,
             "replace_source": replace_source,
+            "include_hevc": include_hevc,
             "output_directory": output_directory,
             "allow_no_audio": allow_no_audio,
             "overrides": overrides_hash,
@@ -1531,12 +1691,13 @@ def plan_batch(
                 use_cache,
                 retry_blocked=retry_failed,
             )
-            if item.should_convert
+            if item.should_convert or include_hevc
         ]
         failure_store = FailureStore()
         candidates = exclude_remembered_failures(
             candidates, failure_store, retry_failed, policy_hash
         )
+        candidates = select_exact_media(candidates, directory, selection)
         items = limit_proposed_files(candidates, max_files)
         if not items:
             console.print("No conversion candidates.")
@@ -1810,6 +1971,8 @@ def execute_plan(
                 for file_number, (item, duration, weight) in enumerate(
                     zip(items, durations, weights), start=1
                 ):
+                    if cancellation_requested():
+                        raise KeyboardInterrupt
                     source = Path(str(item["source"]))
                     destination = Path(str(item["destination"]))
                     partial = Path(str(item["partial"]))
@@ -1824,6 +1987,13 @@ def execute_plan(
                         progress.update(total_task, completed=completed_weight)
                         continue
                     attempted += 1
+                    emit_machine_event(
+                        "item",
+                        phase="execute",
+                        source=str(source),
+                        index=file_number,
+                        total=len(items),
+                    )
                     file_task = progress.add_task(
                         f"[{file_number}/{len(items)}] {source.name}", total=100
                     )
@@ -2020,6 +2190,8 @@ def execute_plan(
                                 assert process.stdout is not None
                                 early_size: Optional[int] = None
                                 for line in process.stdout:
+                                    if cancellation_requested():
+                                        raise KeyboardInterrupt
                                     diagnostics.append(line)
                                     match = progress_pattern.search(line)
                                     if match:
@@ -2028,6 +2200,14 @@ def execute_plan(
                                         progress.update(
                                             total_task,
                                             completed=completed_weight + weight * percent / 100,
+                                        )
+                                        emit_machine_event(
+                                            "progress",
+                                            phase="execute",
+                                            source=str(source),
+                                            index=file_number,
+                                            total=len(items),
+                                            percent=percent,
                                         )
                                     if replace_source and stop_when_larger:
                                         early_size = partial_reached_source_size(
@@ -2187,6 +2367,14 @@ def execute_plan(
                         progress.update(total_task, completed=completed_weight)
                         progress.remove_task(file_task)
                         write_state(journal_path, state)
+                        emit_machine_event(
+                            "item-result",
+                            phase="execute",
+                            source=str(source),
+                            index=file_number,
+                            total=len(items),
+                            result=statuses.get(str(source), {}),
+                        )
                     if stop_after_current or (max_failures and failures >= max_failures):
                         break
         finally:
@@ -2194,8 +2382,18 @@ def execute_plan(
         console.print(
             f"[green]State:[/] {journal_path.resolve()} · {attempted} attempted · {failures} failed"
         )
+        emit_machine_event(
+            "summary",
+            phase="execute",
+            attempted=attempted,
+            failed=failures,
+            state_file=str(journal_path.resolve()),
+        )
         if failures:
             raise typer.Exit(1)
+    except KeyboardInterrupt:
+        console.print("[yellow]Cancelled.[/] State saved; completed work remains.")
+        raise typer.Exit(130)
     except BrakeSmithError as error:
         console.print(f"[red]Error:[/] {error}")
         raise typer.Exit(2)
@@ -2375,6 +2573,9 @@ def run_batch(
     max_files: Optional[int] = typer.Option(
         None, min=1, help="Maximum conversion candidates; interactive runs ask when omitted."
     ),
+    selection: Optional[Path] = typer.Option(
+        None, exists=True, dir_okay=False, help="JSON list of exact source paths to include."
+    ),
     audio: str = typer.Option("eng,fra", help="Audio languages to keep (ISO codes or names)."),
     subtitles: str = typer.Option("eng,fra", help="Subtitle languages to keep."),
     unknown_audio: str = typer.Option("ask", help="Unlabelled audio tracks: ask, keep, or drop."),
@@ -2543,6 +2744,7 @@ def run_batch(
         candidates = exclude_remembered_failures(
             candidates, failure_store, retry_failed, policy_hash
         )
+        candidates = select_exact_media(candidates, directory, selection)
         items = limit_proposed_files(candidates, max_files)
         if not items:
             console.print("No conversion candidates.")
@@ -2694,6 +2896,13 @@ def run_batch(
                 destination = destinations[item.path]
                 ensure_source_unchanged(snapshots[item.path])
                 partial = destination.with_name(destination.name + ".part")
+                emit_machine_event(
+                    "item",
+                    phase="run",
+                    source=str(item.path),
+                    index=file_number,
+                    total=len(items),
+                )
                 if destination.exists():
                     try:
                         require_matching_existing_output(
@@ -2928,6 +3137,14 @@ def run_batch(
                                 total_task,
                                 completed=(file_number - 1) + percent / 100,
                             )
+                            emit_machine_event(
+                                "progress",
+                                phase="run",
+                                source=str(item.path),
+                                index=file_number,
+                                total=len(items),
+                                percent=percent,
+                            )
                         if replace_source and stop_when_larger:
                             early_size = partial_reached_source_size(
                                 partial, snapshots[item.path].size
@@ -3120,6 +3337,14 @@ def run_batch(
     console.print(
         f"[green]Done:[/] {completed} completed, {skipped} skipped, {failures} failed. "
         f"{source_result}"
+    )
+    emit_machine_event(
+        "summary",
+        phase="run",
+        completed=completed,
+        skipped=skipped,
+        failed=failures,
+        total=len(items),
     )
     if summary:
         try:

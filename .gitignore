@@ -4,6 +4,17 @@ __pycache__/
 .ruff_cache/
 .venv/
 dist/
+build/
+*.spec
+desktop/dist/
+desktop/node_modules/
+desktop/output/
+desktop/.playwright-cli/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/src-tauri/binaries/brakesmith-*
+desktop/src-tauri/icons/android/
+desktop/src-tauri/icons/ios/
 *.egg-info/
 .DS_Store
 *.brakesmith.mkv

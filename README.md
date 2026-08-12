@@ -51,6 +51,7 @@ It is review-first. Output is written to a temporary file and published only aft
 - Compact/detailed views, grouped summaries, filters, and named TOML profiles.
 - Custom extensions for unusual HandBrake-compatible containers.
 - Standalone executable artifacts built for macOS, Windows, and Linux.
+- Optional Tauri desktop interface with the same CLI engine on macOS, Windows, and Linux.
 
 ## Safety model
 
@@ -116,6 +117,14 @@ pipx install git+https://github.com/me-cedric/BrakeSmith.git
 ```
 
 Standalone executables are available as CI artifacts for macOS, Windows, and Linux. They bundle BrakeSmith and Python. HandBrakeCLI and ffprobe remain external requirements. Full health checks also need ffmpeg.
+
+### Optional desktop interface
+
+BrakeSmith Desktop provides the full workflow in a local interface: library state, exact file selection, transcode settings, sealed plan review, progress, safe stop, blocked outcomes, history, health checks, and registry cleanup.
+
+Desktop bundles include the same BrakeSmith CLI as a sidecar. The CLI-only install remains fully supported. HandBrakeCLI and ffprobe stay external requirements. Desktop workflow artifacts are unsigned development builds until normal project releases include them.
+
+See [desktop/README.md](desktop/README.md) for architecture, development, and packaging instructions.
 
 From source:
 
@@ -442,6 +451,8 @@ uv build
 ```
 
 CI tests Python 3.9 and 3.13 on macOS, Windows, and Linux, builds wheel/source and standalone distributions, then performs a real HandBrake encode on Linux. A real multilingual encode is also checked on macOS before release.
+
+The separate desktop workflow tests React and Rust, builds the PyInstaller sidecar, and creates unsigned Tauri bundles on macOS, Windows, and Linux. It uploads workflow artifacts only. It does not create tags or releases.
 
 ## License
 

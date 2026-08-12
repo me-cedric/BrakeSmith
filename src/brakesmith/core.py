@@ -199,15 +199,11 @@ def resolve_format_settings(
 ) -> FormatSettings:
     resolution = content_resolution(media)
     if name == "custom":
-        return FormatSettings(
-            name, resolution, quality, preset, bit_depth, encoder_profile, False
-        )
+        return FormatSettings(name, resolution, quality, preset, bit_depth, encoder_profile, False)
     if name not in FORMAT_PRESETS:
         raise BrakeSmithError(f"Unknown format preset: {name}")
     resolved_quality, resolved_preset = FORMAT_PRESETS[name][resolution]
-    return FormatSettings(
-        name, resolution, resolved_quality, resolved_preset, 10, "main10", True
-    )
+    return FormatSettings(name, resolution, resolved_quality, resolved_preset, 10, "main10", True)
 
 
 def text_subtitle_tracks(media: MediaFile, selected: Iterable[int]) -> list[int]:
@@ -226,9 +222,7 @@ def expected_audio_track_count(
     if not library_audio:
         return len(selected_ids)
     return sum(
-        2 if track.channels > 2 else 1
-        for track in media.audio
-        if track.type_index in selected_ids
+        2 if track.channels > 2 else 1 for track in media.audio if track.type_index in selected_ids
     )
 
 
@@ -368,17 +362,17 @@ def find_executable(name: str, explicit: Path | None = None) -> str | None:
     found = shutil.which(name)
     if found:
         return found
+    homebrew = [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+    candidates = [directory / name for directory in homebrew]
     if name == "HandBrakeCLI":
         candidates = [
             Path("/Applications/HandBrakeCLI"),
-            Path("/usr/local/bin/HandBrakeCLI"),
-            Path("/opt/homebrew/bin/HandBrakeCLI"),
+            *candidates,
             Path(os.environ.get("ProgramFiles", "C:/Program Files"))
             / "HandBrake"
             / "HandBrakeCLI.exe",
         ]
-        return next((str(path) for path in candidates if path.is_file()), None)
-    return None
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 
 def discover(
