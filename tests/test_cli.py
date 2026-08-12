@@ -1,5 +1,5 @@
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
@@ -13,14 +13,16 @@ runner = CliRunner()
 
 
 def test_media_tools_use_homebrew_fallbacks(monkeypatch):
-    monkeypatch.setattr(core.shutil, "which", lambda name: None)
-    monkeypatch.setattr(
-        Path,
-        "is_file",
-        lambda path: str(path) == "/opt/homebrew/bin/ffprobe",
-    )
+    class WindowsPath(PureWindowsPath):
+        def is_file(self):
+            return self.as_posix() == "/opt/homebrew/bin/ffprobe"
 
-    assert core.find_executable("ffprobe") == "/opt/homebrew/bin/ffprobe"
+    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core, "Path", WindowsPath)
+
+    found = core.find_executable("ffprobe")
+    assert found is not None
+    assert WindowsPath(found).as_posix() == "/opt/homebrew/bin/ffprobe"
 
 
 def test_bridge_failed_json_command_keeps_cli_diagnostic():
